@@ -110,6 +110,9 @@ def _apply_sqlite_compat_migrations(engine: Engine) -> None:
             "confidence_score": "FLOAT DEFAULT 0.0",
             "detected_at_ms": "INTEGER",
             "source": "VARCHAR(64) DEFAULT 'fills'",
+            "snapshot_id": "INTEGER",
+            "is_paper_eligible": "BOOLEAN DEFAULT 0",
+            "proofs_json": "JSON",
             "delta_hash": "VARCHAR(64)",
             "raw_json": "JSON",
         }
@@ -118,6 +121,27 @@ def _apply_sqlite_compat_migrations(engine: Engine) -> None:
                 if column_name not in delta_existing:
                     connection.execute(
                         text(f"ALTER TABLE position_deltas ADD COLUMN {column_name} {column_type}")
+                    )
+    if "wallet_snapshots" in table_names:
+        snapshot_existing = {column["name"] for column in inspector.get_columns("wallet_snapshots")}
+        snapshot_missing_columns = {
+            "collection_run_id": "INTEGER",
+            "local_received_ts": "INTEGER",
+            "positions_json": "JSON",
+            "open_orders_json": "JSON",
+            "frontend_open_orders_json": "JSON",
+            "fills_json": "JSON",
+            "all_mids_json": "JSON",
+            "source": "VARCHAR(64)",
+            "stopped_reason": "VARCHAR(128)",
+            "errors_json": "JSON",
+            "summary": "TEXT",
+        }
+        with engine.begin() as connection:
+            for column_name, column_type in snapshot_missing_columns.items():
+                if column_name not in snapshot_existing:
+                    connection.execute(
+                        text(f"ALTER TABLE wallet_snapshots ADD COLUMN {column_name} {column_type}")
                     )
     if "positions" in table_names:
         position_existing = {column["name"] for column in inspector.get_columns("positions")}

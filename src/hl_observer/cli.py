@@ -97,6 +97,7 @@ from hl_observer.wallets.public_trades_live import (
     scan_public_trades_ws,
     store_public_trade_scan,
 )
+from hl_observer.wallets.snapshot_service import record_robust_snapshot
 from hl_observer.wallets.top500_bootstrap import bootstrap_top_wallets, format_top500_report
 from hl_observer.wallets.scan_queue import format_scan_queue_report, scan_wallet_queue
 from hl_observer.analysis.opening_detector import detect_openings_from_deltas
@@ -127,6 +128,16 @@ def _settings() -> Settings:
 def _session_factory(settings: Settings):
     initialize_database(settings.database_url)
     return create_session_factory(create_sqlite_engine(settings.database_url))
+
+
+def _record_local_snapshots(settings: Settings, wallets: list[str], *, run_id: int | None, source: str) -> None:
+    if not wallets:
+        return
+    session_factory = _session_factory(settings)
+    with session_factory() as session:
+        for wallet in wallets:
+            record_robust_snapshot(session, wallet, run_id=run_id, source=source, echo_func=typer.echo)
+        session.commit()
 
 
 def _leaderboard_model_to_candidate(row: LeaderboardWalletCandidate) -> LeaderboardCandidate:
@@ -333,6 +344,7 @@ def collect_once(
         f"run_id={result.run_id} fetched={result.fetched_items} "
         f"raw_events={result.raw_events_stored} errors={result.errors_count}"
     )
+    _record_local_snapshots(settings, plan.wallets, run_id=result.run_id, source="collect-once")
 
 
 @app.command("discover-markets")
@@ -482,6 +494,7 @@ def wallet_backfill(
         if report:
             typer.echo(format_wallet_backfill_report(result, plan))
         return
+    _record_local_snapshots(settings, plan.wallets, run_id=result.run_id, source="wallet-backfill")
     if report:
         typer.echo(format_wallet_backfill_report(result, plan))
         return

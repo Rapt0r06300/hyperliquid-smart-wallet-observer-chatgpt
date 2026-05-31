@@ -346,6 +346,8 @@ async def _collect_plan(
                     )
                     result.raw_events_stored += 1
                 repo.store_fills(wallet, page)
+                repo.update_source_health("hyperliquid_info:userFillsByTime", is_success=True)
+                repo.update_source_health("leader_fills", is_success=True)
                 result.fetched_items += 1
         if plan.oid_or_cloid is not None:
             await _record_call(
@@ -390,11 +392,23 @@ async def _record_call(
     on_success: Callable[[Any], Any] | None = None,
 ) -> None:
     started = now_ms()
+    source_name = f"hyperliquid_info:{item_type}"
+    if item_type == "allMids":
+        source_name = "allMids"
+    elif item_type == "l2Book":
+        source_name = "l2Book"
     try:
         payload = await call()
     except Exception as exc:  # noqa: BLE001 - stored for audit instead of hidden.
         error_message = str(exc)
         result.errors_count += 1
+        repo.update_source_health(
+            source_name,
+            is_success=False,
+            observed_latency_ms=now_ms() - started,
+            is_heartbeat=item_type in {"allMids", "l2Book"},
+            error_message=error_message,
+        )
         repo.add_collection_item(
             run_id=run_id,
             item_type=item_type,
@@ -431,6 +445,14 @@ async def _record_call(
         coin=coin,
         status="ok",
     )
+    repo.update_source_health(
+        source_name,
+        is_success=True,
+        observed_latency_ms=now_ms() - started,
+        is_heartbeat=item_type in {"allMids", "l2Book"},
+    )
+    if item_type == "userFills" or item_type.startswith("userFillsByTime"):
+        repo.update_source_health("leader_fills", is_success=True)
     repo.store_api_health(
         service=f"hyperliquid_info:{item_type}",
         ok=True,

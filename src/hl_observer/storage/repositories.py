@@ -13,6 +13,7 @@ from hl_observer.storage.models import (
     CollectionItem,
     CollectionRun,
     Fill,
+    FreshnessStatus,
     MarketMetric,
     MarketSnapshot,
     MarketUniverseModel,
@@ -22,6 +23,7 @@ from hl_observer.storage.models import (
     PositionDeltaModel,
     RawEvent,
     RejectedSignal,
+    SourceHealth,
     Wallet,
     WalletActivitySummary,
     WalletBackfillRun,
@@ -114,6 +116,63 @@ class CollectionRepository:
         self.session = session
         self._seen_fill_hashes: set[str] = set()
         self._seen_delta_hashes: set[str] = set()
+
+    def update_source_health(
+        self,
+        source_name: str,
+        *,
+        is_success: bool = True,
+        event_timestamp_ms: int | None = None,
+        observed_latency_ms: int | None = None,
+        is_consistent: bool = True,
+        is_heartbeat: bool = False,
+        error_message: str | None = None,
+    ) -> SourceHealth:
+        current_ms = now_ms()
+        event_ms = event_timestamp_ms if event_timestamp_ms and event_timestamp_ms > 0 else (current_ms if is_success else None)
+        seconds_since = int(max(0, (current_ms - event_ms) / 1000)) if event_ms is not None else None
+
+        if not is_consistent:
+            freshness = FreshnessStatus.CONTRADICTORY
+        elif not is_success:
+            freshness = FreshnessStatus.DEAD if event_ms is None else FreshnessStatus.STALE
+        elif event_ms is None:
+            freshness = FreshnessStatus.ABSENT
+        elif observed_latency_ms is not None and observed_latency_ms >= 2_000:
+            freshness = FreshnessStatus.DELAYED
+        elif seconds_since is not None and seconds_since >= 60:
+            freshness = FreshnessStatus.DEAD
+        elif seconds_since is not None and seconds_since >= 10:
+            freshness = FreshnessStatus.STALE
+        else:
+            freshness = FreshnessStatus.FRESH
+
+        health = self.session.get(SourceHealth, source_name)
+        if health is None:
+            health = next(
+                (
+                    item
+                    for item in self.session.new
+                    if isinstance(item, SourceHealth) and item.source_name == source_name
+                ),
+                None,
+            )
+        if health is None:
+            health = SourceHealth(source_name=source_name)
+        health.last_event_at_ms = event_ms
+        if is_success:
+            health.last_success_at_ms = current_ms
+        health.seconds_since_last_event = seconds_since
+        health.observed_latency_ms = observed_latency_ms
+        health.freshness_status = freshness.value
+        health.is_consistent = is_consistent
+        health.is_heartbeat = is_heartbeat
+        health.error_message = error_message
+        self.session.add(health)
+        return health
+
+    def get_source_health_map(self) -> dict[str, SourceHealth]:
+        return {row.source_name: row for row in self.session.query(SourceHealth).all()}
 
     def create_collection_run(
         self,
@@ -327,17 +386,47 @@ class CollectionRepository:
     def store_wallet_snapshot(
         self,
         wallet_address: str,
-        response_payload: dict[str, Any],
+        response_payload: dict[str, Any] | None = None,
         *,
+        raw_json: dict[str, Any] | None = None,
+        collection_run_id: int | None = None,
+        local_received_ts: int | None = None,
         exchange_ts: int | None = None,
+        positions: list | None = None,
+        open_orders: list | None = None,
+        frontend_open_orders: list | None = None,
+        fills: list | None = None,
+        all_mids: dict | None = None,
+        source: str | None = None,
+        stopped_reason: str | None = None,
+        errors: list | None = None,
     ) -> WalletSnapshot:
+        payload = raw_json if raw_json is not None else response_payload or {}
         snapshot = WalletSnapshot(
             wallet_address=wallet_address,
+            collection_run_id=collection_run_id,
+            local_received_ts=local_received_ts,
             exchange_ts=exchange_ts,
-            raw_json=response_payload,
+            positions_json=positions,
+            open_orders_json=open_orders,
+            frontend_open_orders_json=frontend_open_orders,
+            fills_json=fills,
+            all_mids_json=all_mids,
+            raw_json=payload,
+            source=source,
+            stopped_reason=stopped_reason,
+            errors_json=errors,
         )
         self.session.add(snapshot)
         return snapshot
+
+    def get_latest_wallet_snapshot(self, wallet_address: str) -> WalletSnapshot | None:
+        return (
+            self.session.query(WalletSnapshot)
+            .filter(WalletSnapshot.wallet_address == wallet_address)
+            .order_by(WalletSnapshot.id.desc())
+            .first()
+        )
 
     def store_fills(self, wallet_address: str, response_payload: list[dict[str, Any]]) -> list[Fill]:
         stored: list[Fill] = []
@@ -454,6 +543,9 @@ class CollectionRepository:
             confidence = (
                 "high" if confidence_score >= 0.85 else "medium" if confidence_score >= 0.5 else "low"
             )
+            snapshot_id = delta.snapshot_id
+            is_paper_eligible = delta.is_paper_eligible
+            proofs = delta.proofs
         else:
             wallet_address = delta.wallet
             coin = delta.coin.upper()
@@ -480,6 +572,9 @@ class CollectionRepository:
             detected_at_ms = now_ms()
             delta_type = delta.delta_type
             confidence = delta.confidence
+            snapshot_id = None
+            is_paper_eligible = False
+            proofs = None
 
         if delta_hash in self._seen_delta_hashes:
             return None
@@ -511,11 +606,15 @@ class CollectionRepository:
             confidence_score=confidence_score,
             detected_at_ms=detected_at_ms,
             source=getattr(delta, "source", "fills"),
+            snapshot_id=snapshot_id,
+            is_paper_eligible=is_paper_eligible,
+            proofs_json=proofs,
             delta_hash=delta_hash,
             raw_json=raw,
         )
         self.session.add(model)
         self._seen_delta_hashes.add(delta_hash)
+        self.update_source_health("position_deltas", event_timestamp_ms=exchange_ts)
         return model
 
     def store_position_deltas(self, deltas: list[PositionDelta | PositionDeltaRecord]) -> list[PositionDeltaModel]:

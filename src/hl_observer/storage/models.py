@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from enum import StrEnum
+
 from sqlalchemy import Boolean, JSON, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -11,6 +13,29 @@ from hl_observer.utils.time import utc_now
 
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class FreshnessStatus(StrEnum):
+    FRESH = "FRESH"
+    DELAYED = "DELAYED"
+    STALE = "STALE"
+    DEAD = "DEAD"
+    ABSENT = "ABSENT"
+    CONTRADICTORY = "CONTRADICTORY"
+    UNKNOWN = "UNKNOWN"
+
+
+class SourceHealth(Base, TimestampMixin):
+    __tablename__ = "source_health"
+    source_name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    last_event_at_ms: Mapped[int | None] = mapped_column(Integer)
+    last_success_at_ms: Mapped[int | None] = mapped_column(Integer)
+    seconds_since_last_event: Mapped[int | None] = mapped_column(Integer)
+    observed_latency_ms: Mapped[int | None] = mapped_column(Integer)
+    freshness_status: Mapped[str] = mapped_column(String(32), default=FreshnessStatus.UNKNOWN.value)
+    is_consistent: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_heartbeat: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
 
 
 class Wallet(Base, TimestampMixin):
@@ -35,8 +60,19 @@ class WalletSnapshot(Base, TimestampMixin):
     __tablename__ = "wallet_snapshots"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     wallet_address: Mapped[str] = mapped_column(String(64), index=True)
+    collection_run_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    local_received_ts: Mapped[int | None] = mapped_column(Integer, index=True)
     exchange_ts: Mapped[int | None] = mapped_column(Integer)
+    positions_json: Mapped[list | None] = mapped_column(JSON)
+    open_orders_json: Mapped[list | None] = mapped_column(JSON)
+    frontend_open_orders_json: Mapped[list | None] = mapped_column(JSON)
+    fills_json: Mapped[list | None] = mapped_column(JSON)
+    all_mids_json: Mapped[dict | None] = mapped_column(JSON)
     raw_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    source: Mapped[str | None] = mapped_column(String(64))
+    stopped_reason: Mapped[str | None] = mapped_column(String(128))
+    errors_json: Mapped[list | None] = mapped_column(JSON)
+    summary: Mapped[str | None] = mapped_column(Text)
 
 
 class WalletScoreModel(Base, TimestampMixin):
@@ -223,6 +259,9 @@ class PositionDeltaModel(Base, TimestampMixin):
     confidence_score: Mapped[float] = mapped_column(Float, default=0.0)
     detected_at_ms: Mapped[int | None] = mapped_column(Integer)
     source: Mapped[str] = mapped_column(String(64), default="fills")
+    snapshot_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    is_paper_eligible: Mapped[bool] = mapped_column(Boolean, default=False)
+    proofs_json: Mapped[dict | None] = mapped_column(JSON)
     delta_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     raw_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
