@@ -92,6 +92,20 @@ class AppConfig:
     copy_min_history_days: float = 7.0
     copy_min_closed_pnl_points: int = 10
 
+    def __post_init__(self) -> None:
+        root = Path(self.runtime_root)
+        object.__setattr__(self, "runtime_root", root)
+        for field_name in (
+            "database_path",
+            "dashboard_dir",
+            "reports_dir",
+            "archive_output_dir",
+        ):
+            value = Path(getattr(self, field_name))
+            if not value.is_absolute() and root != Path("."):
+                value = root / value
+            object.__setattr__(self, field_name, value)
+
     @property
     def runtime_mode(self) -> RuntimeMode:
         return RuntimeMode(self.mode)

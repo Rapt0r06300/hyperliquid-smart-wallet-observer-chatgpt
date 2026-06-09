@@ -63,6 +63,12 @@ def first_present(payload: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def public_fill_payload(fill: dict[str, Any]) -> dict[str, Any]:
+    """Drop local observer metadata before hashing/storing external fill payloads."""
+
+    return {key: value for key, value in fill.items() if not str(key).startswith("_hypersmart_")}
+
+
 def position_side(size: float | None) -> PositionSide:
     if size is None:
         return PositionSide.UNKNOWN
@@ -184,6 +190,9 @@ def build_position_delta_from_fill(
         direction_unclear=direction_unclear,
         has_start_position=has_start,
     )
+    source = str(first_present(fill, "_hypersmart_source") or "user_fills")
+    if source != "user_fills":
+        notes.append(f"source:{source}")
 
     return PositionDeltaRecord(
         wallet_address=wallet_address,
@@ -201,6 +210,7 @@ def build_position_delta_from_fill(
         fill_size=size,
         confidence_score=confidence_score,
         is_paper_eligible=confidence_score >= 0.7,
+        source=source,
         notes=notes,
-        raw=fill,
+        raw=public_fill_payload(fill),
     )

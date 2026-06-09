@@ -7,6 +7,7 @@ let fullRefreshInFlight = false;
 let simulationRefreshInFlight = false;
 let lastSimulationPayload = null;
 let simulationFetchFailures = 0;
+const SIMULATION_CACHE_KEY = "hypersmart:lastSimulationOverview:v1";
 
 function tickClock() {
   $("#clock").textContent = new Date().toLocaleTimeString();
@@ -25,6 +26,11 @@ function formatUsd(value) {
   const number = Number(value || 0);
   const sign = number > 0 ? "+" : "";
   return `${sign}$${number.toFixed(2)}`;
+}
+
+function formatBalance(value) {
+  const number = Number(value || 0);
+  return `$${number.toFixed(2)}`;
 }
 
 function formatClockMs(value) {
@@ -67,15 +73,76 @@ async function getJsonWithRetry(url, attempts = 3, delayMs = 250) {
   throw lastError || new Error(`${url} failed`);
 }
 
+function compactSimulationCachePayload(payload) {
+  const botSimulation = payload.bot_simulation || payload.reproduction || {};
+  return {
+    mode: payload.mode,
+    paper_mock_usdc_only: payload.paper_mock_usdc_only,
+    no_real_orders: payload.no_real_orders,
+    no_testnet_executor: payload.no_testnet_executor,
+    readiness: payload.readiness,
+    message: payload.message,
+    next_step: payload.next_step,
+    simulation_started_at_ms: payload.simulation_started_at_ms,
+    fresh_cutoff_ms: payload.fresh_cutoff_ms,
+    last_live_event_ms: payload.last_live_event_ms,
+    seconds_since_last_live_event: payload.seconds_since_last_live_event,
+    counts: payload.counts || {},
+    scanner: payload.scanner || {},
+    autopilot: payload.autopilot || {},
+    fresh_data_coverage: payload.fresh_data_coverage || payload.warehouse_coverage || {},
+    equity: payload.equity || {},
+    pnl_consistency: payload.pnl_consistency || {},
+    loss_diagnostics: payload.loss_diagnostics || {},
+    decision_log_pnl: payload.decision_log_pnl || {},
+    equity_candles: (payload.equity_candles || []).slice(-180),
+    session_equity_history: (payload.session_equity_history || []).slice(-180),
+    no_trade_reasons: (payload.no_trade_reasons || []).slice(0, 20),
+    leaders: (payload.leaders || []).slice(0, 50),
+    consensus: (payload.consensus || []).slice(0, 12),
+    entry_deltas: (payload.entry_deltas || []).slice(0, 30),
+    public_trade_activity: (payload.public_trade_activity || []).slice(0, 10),
+    bot_simulation: {
+      reproduced_entries: botSimulation.reproduced_entries || 0,
+      reproduced_exits: botSimulation.reproduced_exits || 0,
+      refused: botSimulation.refused || 0,
+      important_events: (botSimulation.important_events || []).slice(0, 80),
+      events: (botSimulation.events || []).slice(0, 80),
+      open_positions: (botSimulation.open_positions || []).slice(0, 25)
+    }
+  };
+}
+
 async function getSimulationOverviewPayload() {
   try {
-    const payload = await getJsonWithRetry("/api/simulation/overview", 3, 250);
+    const payload = await getJsonWithRetry("/api/simulation/overview?limit=80", 3, 250);
     lastSimulationPayload = payload;
     simulationFetchFailures = 0;
+    try {
+      const compactPayload = JSON.stringify(compactSimulationCachePayload(payload));
+      try {
+        localStorage.setItem(SIMULATION_CACHE_KEY, compactPayload);
+      } catch (_quotaError) {
+        localStorage.removeItem(SIMULATION_CACHE_KEY);
+        localStorage.setItem(SIMULATION_CACHE_KEY, compactPayload);
+      }
+    } catch (storageError) {
+      console.warn("simulation cache write skipped", storageError);
+    }
     return payload;
   } catch (error) {
     simulationFetchFailures += 1;
     console.warn("simulation overview refresh failed", error);
+    if (!lastSimulationPayload) {
+      try {
+        const cached = localStorage.getItem(SIMULATION_CACHE_KEY);
+        if (cached) {
+          lastSimulationPayload = JSON.parse(cached);
+        }
+      } catch (storageError) {
+        console.warn("simulation cache read skipped", storageError);
+      }
+    }
     if (lastSimulationPayload) {
       return {
         ...lastSimulationPayload,
@@ -99,6 +166,21 @@ async function getSimulationOverviewPayload() {
         source: "waiting_for_local_api"
       },
       bot_simulation: { events: [], open_positions: [], reproduced_entries: 0, reproduced_exits: 0, refused: 0 },
+      pnl_consistency: {
+        ok: true,
+        status: "OK",
+        recomputed_total_pnl_usdc: 0,
+        recomputed_equity_usdt: 1000,
+        display_note: "Solde en attente: 1000 USDT + 0 gain/perte."
+      },
+      loss_diagnostics: {
+        current_session_pnl_usdc: 0,
+        negative_events: 0,
+        positive_events: 0,
+        stale_ratio: 0,
+        costs_paid_usdc: 0,
+        recommendations: ["Attente de la connexion locale; aucune decision inventee."]
+      },
       no_trade_reasons: [{ reason: "LOCAL_API_RETRYING", count: simulationFetchFailures }],
       equity_candles: [],
       readiness: "LOCAL_API_RETRYING",
@@ -394,7 +476,7 @@ function renderCopyStatus(payload) {
   `).join("");
   target.innerHTML = `
     <div class="feed-line"><span class="cyan">[COPY]</span> ${header.map(escapeHtml).join(" :: ")}</div>
-    <div class="feed-line"><span class="orange">[SAFE]</span> dry-run paper/mock USDC seulement, aucun ordre reel.</div>
+    <div class="feed-line"><span class="orange">[SAFE]</span> positions virtuelles paper/mock USDC seulement, aucune execution reelle.</div>
     ${leaderRows || `<div class="feed-line"><span class="orange">[VIDE]</span> Aucun leader shortlist pour le moment.</div>`}
   `;
 }
@@ -427,6 +509,27 @@ function renderNoTradeReport(payload) {
     : `<div class="feed-line"><span class="cyan">[INFO]</span> Aucun signal refuse stocke. Un signal sans edge_remaining_bps positif sera bloque.</div>`;
 }
 
+function uniqueSimulationRows(rows, limit = 80) {
+  const seen = new Set();
+  const output = [];
+  for (const row of rows || []) {
+    const key = [
+      row.wallet_address || "",
+      row.coin || "",
+      row.leader_action || "",
+      row.leader_side || "",
+      row.observed_at_ms || "",
+      row.reason || "",
+      row.bot_replay_action || ""
+    ].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(row);
+    if (output.length >= limit) break;
+  }
+  return output;
+}
+
 function renderSimulationOverview(payload) {
   const summary = $("#simulationSummary");
   if (!summary) return;
@@ -434,11 +537,18 @@ function renderSimulationOverview(payload) {
   const equity = payload.equity || {};
   const scanner = payload.scanner || {};
   const autopilot = payload.autopilot || {};
+  const pipeline = payload.signal_pipeline || {};
+  const freshCoverage = payload.fresh_data_coverage || payload.warehouse_coverage || {};
+  const pnlConsistency = payload.pnl_consistency || {};
+  const lossDiagnostics = payload.loss_diagnostics || {};
+  const decisionLogPnl = payload.decision_log_pnl || {};
   const metrics = [
-    ["P&L bot", formatUsd(equity.current_pnl_usdc ?? 0)],
-    ["Capital", `${formatUsd(equity.current_equity_usdt ?? 1000)} USDT`],
-    ["Latent", formatUsd(equity.unrealized_pnl_usdc ?? 0)],
-    ["Realise", formatUsd(equity.realized_pnl_usdc ?? 0)]
+    ["Gain/perte session", formatUsd(equity.current_pnl_usdc ?? 0)],
+    ["Solde fictif actuel", `${formatBalance(equity.current_equity_usdt ?? 1000)} USDT`],
+    ["Gain/perte encaisse", formatUsd(equity.realized_pnl_usdc ?? 0)],
+    ["Gain/perte en cours", formatUsd(equity.unrealized_pnl_usdc ?? 0)],
+    ["Capital utilise", `${formatBalance(equity.open_exposure_usdt ?? 0)} / libre ${formatBalance(equity.free_equity_usdt ?? 1000)}`],
+    ["Journal decisions", `${formatUsd(decisionLogPnl.closed_log_event_pnl_usdc ?? 0)} / ${Number(decisionLogPnl.events || 0)} evts`]
   ];
   summary.innerHTML = metrics.map(([label, value]) => `
     <div class="simulation-metric">
@@ -456,33 +566,66 @@ function renderSimulationOverview(payload) {
     const refused = Number(counts.bot_refused || 0);
     const entries = Number(counts.reproduced_entries || 0);
     const deltas = Number(counts.live_simulation_deltas || 0);
+    const consensus4s = Number(pipeline.fresh_consensus_groups_4s || counts.consensus_positions || 0);
     const lastReason = (payload.no_trade_reasons || [])[0]?.reason || "aucun refus";
+    const firstBottleneck = (freshCoverage.bottlenecks || [])[0] || "aucun blocage frais";
     const latestTrade = (payload.public_trade_activity || [])[0];
+    const liveStale = Boolean(payload.live_data_stale);
+    const beginnerStatus = payload.beginner_status || {};
     const connectionWarning = payload.connection_warning
       ? `<div class="simulation-live-pill red"><span>Connexion</span><strong>${escapeHtml(payload.connection_warning)}</strong></div>`
       : "";
+    const pnlControlClass = pnlConsistency.ok === false ? "red" : "green";
+    const pnlControlText = pnlConsistency.ok === false
+      ? `a verifier :: ecart ${formatUsd(pnlConsistency.pnl_delta_usdc || 0)}`
+      : "OK :: solde = 1000 + gains/pertes";
     liveStrip.innerHTML = `
+      <div class="simulation-live-pill ${liveStale ? "red" : "green"}">
+        <span>Etat simple</span>
+        <strong>${escapeHtml(beginnerStatus.simple_state || (liveStale ? "Flux live perime" : "Flux live pret"))}</strong>
+      </div>
+      <div class="simulation-live-pill ${pnlControlClass}">
+        <span>Controle du solde</span>
+        <strong>${escapeHtml(pnlControlText)}</strong>
+      </div>
+      <div class="simulation-live-pill ${Number(decisionLogPnl.closed_log_event_pnl_usdc || 0) < 0 ? "red" : "green"}">
+        <span>Journal decisions</span>
+        <strong>${escapeHtml(formatUsd(decisionLogPnl.closed_log_event_pnl_usdc || 0))} :: ${escapeHtml(decisionLogPnl.events || 0)} evenements</strong>
+      </div>
       <div class="simulation-live-pill green">
         <span>Scan public read-only</span>
         <strong>${escapeHtml(counts.public_trade_wallets_seen || scanner.public_trade_wallets_seen || 0)} wallets vus / ${escapeHtml(counts.public_trade_promoted_wallets || scanner.public_trade_promoted_wallets || 0)} promus</strong>
       </div>
-      <div class="simulation-live-pill ${deltas ? "green" : "orange"}">
-        <span>Deltas leaders frais</span>
-        <strong>${escapeHtml(deltas)} analyses :: ${escapeHtml(lastEventText)}</strong>
+      <div class="simulation-live-pill ${freshCoverage.readiness === "SIMULATION_INPUT_READY" ? "green" : "orange"}">
+        <span>Donnees fraiches</span>
+        <strong>${escapeHtml(freshCoverage.fresh_entry_deltas || 0)} ouvertures :: ${escapeHtml(freshCoverage.fresh_position_deltas || 0)} deltas :: ${escapeHtml(freshCoverage.fresh_window_seconds || 0)}s</strong>
+      </div>
+      <div class="simulation-live-pill ${liveStale ? "red" : deltas ? "green" : "orange"}">
+        <span>Deltas leaders analyses</span>
+        <strong>${escapeHtml(deltas)} analyses :: ${escapeHtml(liveStale ? "trop vieux pour copier" : lastEventText)}</strong>
+      </div>
+      <div class="simulation-live-pill ${consensus4s ? "green" : "orange"}">
+        <span>Consensus leaders</span>
+        <strong>${escapeHtml(consensus4s)} groupes chauds :: meme coin + meme sens</strong>
+      </div>
+      <div class="simulation-live-pill ${(equity.market_marks_available || scanner.market_marks_available) ? "green" : "orange"}">
+        <span>Prix marche reels</span>
+        <strong>${escapeHtml(equity.market_marks_available || scanner.market_marks_available || 0)} marks :: ${escapeHtml((equity.market_mark_sources || scanner.market_mark_sources || []).join(", ") || "en attente")}</strong>
       </div>
       <div class="simulation-live-pill ${entries ? "green" : "orange"}">
-        <span>Reproduction locale</span>
-        <strong>${escapeHtml(entries)} entrees / ${escapeHtml(counts.reproduced_exits || 0)} sorties / ${escapeHtml(refused)} refus</strong>
+        <span>Decision du bot</span>
+        <strong>${escapeHtml(entries ? `${entries} entrees locales / ${counts.reproduced_exits || 0} sorties` : "0 entree acceptee; scan actif")} :: ${escapeHtml(refused)} refus</strong>
       </div>
       <div class="simulation-live-pill ${refused && !entries ? "red" : "orange"}">
-        <span>Dernier etat</span>
-        <strong>${latestTrade ? `${escapeHtml(latestTrade.coin)} ${escapeHtml(formatUsd(latestTrade.notional_usdc || 0))}` : escapeHtml(lastReason)}</strong>
+        <span>Blocage principal</span>
+        <strong>${escapeHtml(liveStale ? "signaux trop vieux / edge degrade" : firstBottleneck !== "aucun blocage frais" ? firstBottleneck : latestTrade ? `${latestTrade.coin} ${formatUsd(latestTrade.notional_usdc || 0)}` : lastReason)}</strong>
       </div>
       ${connectionWarning}
     `;
   }
 
   const walletsTarget = $("#simulationWalletsFeed");
+  const freshTarget = $("#simulationFreshFeed");
   const consensusTarget = $("#simulationConsensusFeed");
   const deltasTarget = $("#simulationDeltasFeed");
   const replayTarget = $("#simulationReplayFeed");
@@ -493,7 +636,7 @@ function renderSimulationOverview(payload) {
   const consensus = payload.consensus || [];
   const entryDeltas = payload.entry_deltas || [];
   const botSimulation = payload.bot_simulation || payload.reproduction || {};
-  const replay = botSimulation.events || [];
+  const replay = uniqueSimulationRows([...(botSimulation.important_events || []), ...(botSimulation.events || [])], 80);
   const virtualPositions = botSimulation.open_positions || [];
   const reasons = payload.no_trade_reasons || [];
   equity.public_trade_wallets_seen = counts.public_trade_wallets_seen || scanner.public_trade_wallets_seen || 0;
@@ -533,6 +676,20 @@ function renderSimulationOverview(payload) {
     `).join("")
     : `<div class="feed-line"><span class="orange">[VIDE]</span> Aucun wallet leader charge. Importer des adresses completes ou relancer la discovery read-only.</div>`;
 
+  if (freshTarget) {
+    const bottlenecks = freshCoverage.bottlenecks || [];
+    const nextActions = freshCoverage.next_actions || [];
+    freshTarget.innerHTML = `
+      <div class="feed-line"><span class="${freshCoverage.readiness === "SIMULATION_INPUT_READY" ? "green" : "orange"}">[ETAT]</span> ${escapeHtml(freshCoverage.readiness || "UNKNOWN")} :: fenetre ${escapeHtml(freshCoverage.fresh_window_seconds || 0)}s</div>
+      <div class="feed-line"><span class="cyan">[WALLETS]</span> candidats ${escapeHtml(freshCoverage.wallet_candidates_total || 0)} :: publics ${escapeHtml(freshCoverage.public_trade_candidates || 0)} :: leaders ${escapeHtml(freshCoverage.selected_top_wallets || 0)} :: actifs ${escapeHtml(freshCoverage.fresh_top_wallets || 0)}</div>
+      <div class="feed-line"><span class="cyan">[FLUX]</span> trades publics frais ${escapeHtml(freshCoverage.fresh_public_trade_events || 0)} / ${escapeHtml(freshCoverage.public_trade_events || 0)} :: prix frais ${escapeHtml(freshCoverage.fresh_market_snapshots || 0)} / ${escapeHtml(freshCoverage.market_snapshots_total || 0)}</div>
+      <div class="feed-line"><span class="cyan">[DELTAS]</span> deltas frais ${escapeHtml(freshCoverage.fresh_position_deltas || 0)} / ${escapeHtml(freshCoverage.position_deltas_total || 0)} :: ouvertures fraiches ${escapeHtml(freshCoverage.fresh_entry_deltas || 0)}</div>
+      <div class="feed-line"><span class="cyan">[PAPER]</span> signaux frais ${escapeHtml(freshCoverage.fresh_follow_signals || 0)} / ${escapeHtml(freshCoverage.follow_signals_total || 0)} :: acceptes ${escapeHtml(freshCoverage.accepted_follow_decisions || 0)} :: refuses ${escapeHtml(freshCoverage.rejected_follow_decisions || 0)}</div>
+      <div class="feed-line"><span class="${bottlenecks.length ? "orange" : "green"}">[BLOCAGES]</span> ${escapeHtml(bottlenecks.length ? bottlenecks.join(" | ") : "aucun blocage frais")}</div>
+      <div class="feed-line"><span class="green">[ACTION]</span> ${escapeHtml(nextActions[0] || "Continuer la collecte read-only; aucune donnee inventee.")}</div>
+    `;
+  }
+
   consensusTarget.innerHTML = consensus.length
     ? consensus.slice(0, 8).map((row) => `
       <div class="feed-line">
@@ -541,7 +698,7 @@ function renderSimulationOverview(payload) {
         crowding ${escapeHtml(row.crowding_risk)}
       </div>
     `).join("")
-    : `<div class="feed-line"><span class="cyan">[INFO]</span> Aucun consensus multi-wallet detecte sur la fenetre 5 minutes.</div>`;
+    : `<div class="feed-line"><span class="cyan">[INFO]</span> Aucun consensus multi-wallet detecte sur la fenetre fraiche de 4 secondes.</div>`;
 
   deltasTarget.innerHTML = entryDeltas.length
     ? entryDeltas.slice(0, 10).map((row) => `
@@ -575,10 +732,13 @@ function renderSimulationOverview(payload) {
   positionsTarget.innerHTML = virtualPositions.length
     ? virtualPositions.slice(0, 12).map((row) => {
       const pnl = Number(row.unrealized_pnl_usdc || 0);
+      const mode = row.position_mode === "CONSENSUS_CLUSTER"
+        ? `consensus ${row.leader_wallets_count || 0} leaders`
+        : "leader seul";
       return `
         <div class="feed-line">
           <span class="${pnl >= 0 ? "green" : "red"}">[${escapeHtml(row.direction)}]</span>
-          ${escapeHtml(shortAddress(row.wallet_address))} :: ${escapeHtml(row.coin)} ::
+          ${escapeHtml(row.position_mode === "CONSENSUS_CLUSTER" ? "cluster" : shortAddress(row.wallet_address))} :: ${escapeHtml(row.coin)} :: ${escapeHtml(mode)} ::
           size ${escapeHtml(row.size)} :: entry ${escapeHtml(row.avg_entry_price)} :: mark ${escapeHtml(row.mark_price)} ::
           ${escapeHtml(formatUsd(pnl))}
         </div>
@@ -598,10 +758,19 @@ function renderSimulationOverview(payload) {
   noTradeTarget.innerHTML += `
     <div class="feed-line"><span class="green">[FRESH]</span> mode frais uniquement depuis ${escapeHtml(formatClockMs(payload.fresh_cutoff_ms || payload.simulation_started_at_ms))} :: anciens deltas ignores ${escapeHtml(counts.old_deltas_ignored_fresh_only ?? 0)} :: dernier frais ${escapeHtml(formatClockMs(payload.last_live_event_ms))}</div>
     <div class="feed-line"><span class="cyan">[SCAN]</span> surveillance ${scanner.active ? "active" : "inactive"} :: actifs ${escapeHtml(scanner.target_wallets || counts.target_leaders || 50)} wallets :: flux public ${escapeHtml(counts.public_trade_wallets_seen || scanner.public_trade_wallets_seen || 0)} wallets vus / ${escapeHtml(counts.public_trade_promoted_wallets || scanner.public_trade_promoted_wallets || 0)} promus :: refresh UI ${escapeHtml(scanner.ui_refresh_seconds || 5)}s :: poll ${escapeHtml(scanner.polling_interval_seconds || 300)}s</div>
+    <div class="feed-line"><span class="cyan">[PIPELINE]</span> wallets vus ${escapeHtml(pipeline.wallets_seen_from_public_ws || 0)} -> promus ${escapeHtml(pipeline.wallets_promoted_for_info_followup || 0)} -> leaders uniques ${escapeHtml(pipeline.leaders_loaded_unique || 0)} -> deltas ${escapeHtml(pipeline.leader_deltas_analyzed || 0)} -> consensus 4s ${escapeHtml(pipeline.fresh_consensus_groups_4s || 0)} -> entrees acceptees ${escapeHtml(pipeline.local_entries_accepted || 0)}</div>
+    <div class="feed-line"><span class="${freshCoverage.readiness === "SIMULATION_INPUT_READY" ? "green" : "orange"}">[DONNEES FRAICHES]</span> leaders actifs ${escapeHtml(freshCoverage.fresh_top_wallets || 0)} / ${escapeHtml(freshCoverage.selected_top_wallets || 0)} :: prix frais ${escapeHtml(freshCoverage.fresh_market_snapshots || 0)} :: deltas frais ${escapeHtml(freshCoverage.fresh_position_deltas || 0)} :: ouvertures fraiches ${escapeHtml(freshCoverage.fresh_entry_deltas || 0)}</div>
     <div class="feed-line"><span class="cyan">[AUTO]</span> ${escapeHtml(autopilot.job_a || "leaderboard")} -> ${escapeHtml(autopilot.job_b || "copy_loop")} -> ${escapeHtml(autopilot.job_c || "reports")} :: reproduction ${escapeHtml(autopilot.position_reproduction || "paper research only")}</div>
-    <div class="feed-line"><span class="cyan">[CAPITAL]</span> depart ${escapeHtml(formatUsd(equity.starting_equity_usdt || 1000))} USDT :: actuel ${escapeHtml(formatUsd(equity.current_equity_usdt || 1000))} USDT</div>
-    <div class="feed-line"><span class="cyan">[PNL]</span> source ${escapeHtml(equity.source || "local")} :: realise ${escapeHtml(formatUsd(equity.realized_pnl_usdc || 0))} :: latent ${escapeHtml(formatUsd(equity.unrealized_pnl_usdc || 0))} :: couts ${escapeHtml(formatUsd(equity.bot_costs_paid_usdc || 0))}</div>
-    <div class="feed-line"><span class="green">[HOLD]</span> une position virtuelle reste ouverte jusqu'a REDUCE/CLOSE leader correspondant; elle n'est jamais fermee uniquement parce que le latent est rouge.</div>
+    <div class="feed-line"><span class="cyan">[CAPITAL]</span> depart ${escapeHtml(formatBalance(equity.starting_equity_usdt || 1000))} USDT :: actuel ${escapeHtml(formatBalance(equity.current_equity_usdt || 1000))} USDT</div>
+    <div class="feed-line"><span class="cyan">[CAPITAL UTILISE]</span> positions ouvertes ${escapeHtml(formatBalance(equity.open_exposure_usdt || 0))} :: capital disponible ${escapeHtml(formatBalance(equity.free_equity_usdt ?? 1000))} :: part utilisee ${escapeHtml(Number(equity.open_exposure_pct || 0).toFixed(2))}%</div>
+    <div class="feed-line"><span class="cyan">[PNL]</span> source ${escapeHtml(equity.source || "local")} :: gain/perte realise ${escapeHtml(formatUsd(equity.realized_pnl_usdc || 0))} :: gain/perte ouvert ${escapeHtml(formatUsd(equity.unrealized_pnl_usdc || 0))} :: couts ${escapeHtml(formatUsd(equity.bot_costs_paid_usdc || 0))}</div>
+    <div class="feed-line"><span class="${pnlConsistency.ok === false ? "red" : "green"}">[CONTROLE SOLDE]</span> ${escapeHtml(pnlConsistency.display_note || "Solde controle localement.")} :: gain/perte recalcule ${escapeHtml(formatUsd(pnlConsistency.recomputed_total_pnl_usdc || 0))} :: solde recalcule ${escapeHtml(formatBalance(pnlConsistency.recomputed_equity_usdt || equity.current_equity_usdt || 1000))}</div>
+    <div class="feed-line"><span class="${Number(decisionLogPnl.closed_log_event_pnl_usdc || 0) < 0 ? "red" : "green"}">[JOURNAL DECISIONS]</span> historique local ${escapeHtml(formatUsd(decisionLogPnl.closed_log_event_pnl_usdc || 0))} sur ${escapeHtml(decisionLogPnl.events || 0)} evenements :: scope separe de la session fraiche</div>
+    <div class="feed-line"><span class="${Number((lossDiagnostics.current_session_pnl_usdc || 0)) < 0 ? "red" : "green"}">[DIAGNOSTIC PERTES]</span> negatifs ${escapeHtml(lossDiagnostics.negative_events || 0)} / positifs ${escapeHtml(lossDiagnostics.positive_events || 0)} :: retard ${escapeHtml(Number(lossDiagnostics.stale_ratio || 0).toFixed(2))} :: couts ${escapeHtml(formatUsd(lossDiagnostics.costs_paid_usdc || 0))}</div>
+    <div class="feed-line"><span class="orange">[REGLAGE]</span> ${escapeHtml(((lossDiagnostics.recommendations || [])[0]) || "Continuer a collecter des deltas frais; ne jamais inventer de gain.")}</div>
+    <div class="feed-line"><span class="cyan">[MARK]</span> prix marche ${escapeHtml(equity.market_marks_available || scanner.market_marks_available || 0)} coins :: sources ${escapeHtml((equity.market_mark_sources || scanner.market_mark_sources || []).join(", ") || "aucune")}</div>
+    <div class="feed-line"><span class="green">[HOLD]</span> une position virtuelle reste ouverte jusqu'a REDUCE/CLOSE leader correspondant; elle n'est jamais fermee uniquement parce que le gain/perte en cours est rouge.</div>
+    <div class="feed-line"><span class="${payload.live_data_stale ? "orange" : "green"}">[DEBUTANT]</span> ${escapeHtml((payload.beginner_status || {}).decision_policy || "Le bot refuse les signaux non mesurables avant toute simulation.")}</div>
     <div class="feed-line"><span class="cyan">[ETAT]</span> ${escapeHtml(payload.readiness || "UNKNOWN")} :: ${escapeHtml(payload.message || "Simulation locale seulement.")}</div>
   `;
 }
@@ -614,7 +783,7 @@ function drawSimulationMetaGraph(candles, equity) {
   const rect = canvas.getBoundingClientRect();
   const ratio = window.devicePixelRatio || 1;
   const width = Math.max(640, Math.floor(rect.width || canvas.width));
-  const height = 320;
+  const height = Math.max(220, Math.min(300, Math.floor(rect.height || 260)));
   canvas.width = Math.floor(width * ratio);
   canvas.height = Math.floor(height * ratio);
   const ctx = canvas.getContext("2d");
@@ -658,7 +827,7 @@ function drawSimulationMetaGraph(candles, equity) {
       ? `Scan public actif : ${scanWallets} wallets vus. En attente d'un OPEN/ADD confirme pour bouger le P&L.`
       : "En attente d'un evenement leader frais : P&L bot maintenu a $0.00.";
     ctx.fillText(waitText, 58, mid - 14);
-    state.textContent = "PNL $0.00 frais uniquement";
+    state.textContent = "Gain/perte $0.00 frais uniquement";
     if (liveDeltas > 0 && refused > 0) {
       state.textContent = `NO-TRADE ${refused} refus`;
       state.className = "badge red";
@@ -720,7 +889,7 @@ function drawSimulationMetaGraph(candles, equity) {
   ctx.fillText(formatUsd(maxValue), 8, plotTop + 10);
   ctx.fillText(formatUsd(minValue), 8, plotBottom);
   const current = Number(equity.current_pnl_usdc || candles[candles.length - 1].equity_close || 0);
-  state.textContent = `PNL ${formatUsd(current)}`;
+  state.textContent = `Gain/perte ${formatUsd(current)}`;
   state.className = `badge ${current >= 0 ? "green" : "red"}`;
 
   canvas.onmousemove = (event) => {
@@ -737,8 +906,8 @@ function drawSimulationMetaGraph(candles, equity) {
     tooltip.style.top = `${Math.max(8, event.clientY - bounds.top - 18)}px`;
     tooltip.innerHTML = `
       <strong>${escapeHtml(row.coin)} ${escapeHtml(shortAddress(row.wallet_address))}</strong><br>
-      PnL: ${escapeHtml(formatUsd(row.pnl_usdc))}<br>
-      Equity: ${escapeHtml(formatUsd(row.equity_close))}<br>
+      Gain/perte: ${escapeHtml(formatUsd(row.pnl_usdc))}<br>
+      Solde PnL: ${escapeHtml(formatUsd(row.equity_close))}<br>
       Source: ${escapeHtml(row.source)}
     `;
   };
@@ -837,7 +1006,7 @@ async function loadSimpleHome() {
     safeGetJson("/api/copy/status", {}),
     safeGetJson("/api/copy/leader-activity", []),
     safeGetJson("/api/copy/no-trade-report", {}),
-    getSimulationOverviewPayload()
+    lastSimulationPayload || getSimulationOverviewPayload()
   ]);
   renderSimpleHome(home);
   renderScanOverview(home, autoscan);
@@ -933,4 +1102,5 @@ tickClock();
 wireUi();
 connectWebSocket();
 startAutoScanWithDiscoveryIfAllowed();
+refreshSimulationOverview().catch(() => {});
 loadSimpleHome().catch(() => {});

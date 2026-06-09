@@ -7,6 +7,7 @@ from fastapi.staticfiles import StaticFiles
 
 from hl_observer.config.loader import load_settings
 from hl_observer.config.settings import Settings
+from hl_observer.storage.database import init_db
 from hl_observer.ui.event_bus import UiEventBus
 from hl_observer.ui.persistent_state import load_or_create_ui_state
 from hl_observer.ui.routes import create_router
@@ -15,6 +16,10 @@ from hl_observer.ui.state import UiState
 
 def create_ui_app(settings: Settings | None = None, state: UiState | None = None) -> FastAPI:
     settings = settings or load_settings()
+    # The dashboard must be able to start from a fresh runtime DB. The launcher
+    # also runs init-db, but keeping this here prevents a half-started UI from
+    # returning 500s when the session database is new or was rotated.
+    init_db(settings.database_url)
     state = state or load_or_create_ui_state(settings)
     bus = UiEventBus()
     app = FastAPI(title="Hyperliquid Smart-Wallet Observer Command Center")

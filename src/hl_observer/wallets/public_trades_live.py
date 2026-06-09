@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 from hl_observer.collection.collector import WALLET_RE
 from hl_observer.config.settings import Settings
 from hl_observer.storage.models import (
+    MarketSnapshot,
     RawEvent,
     TopWallet,
     WalletCandidateModel,
@@ -20,6 +22,7 @@ from hl_observer.storage.repositories import CollectionRepository, stable_payloa
 from hl_observer.utils.time import now_ms
 
 DEFAULT_PUBLIC_TRADE_COINS = ["BTC", "ETH", "SOL", "HYPE", "DOGE", "XRP", "BNB", "ENA", "AVAX", "LINK"]
+PUBLIC_TRADES_COIN_RE = re.compile(r"^[A-Z0-9:@_.-]{1,32}$")
 
 
 @dataclass(slots=True)
@@ -70,6 +73,8 @@ def normalize_coin_list(coins: str | Iterable[str] | None) -> list[str]:
         if not item:
             continue
         coin = item.upper()
+        if coin.startswith("#") or not PUBLIC_TRADES_COIN_RE.fullmatch(coin):
+            continue
         if coin in seen:
             continue
         seen.add(coin)
@@ -234,6 +239,8 @@ def store_public_trade_scan(
     *,
     promote_top: int = 50,
 ) -> PublicTradeScanResult:
+    result.wallets_stored = 0
+    result.raw_events_stored = 0
     repo = CollectionRepository(session)
     last_event_ms = max(
         (stats.last_seen_ms or 0 for stats in result.wallet_stats.values()),
@@ -262,6 +269,19 @@ def store_public_trade_scan(
     session.flush()
     if result.raw_trade_samples:
         payload_hash = stable_payload_hash(result.raw_trade_samples)
+        latest_prices_by_coin: dict[str, float] = {}
+        latest_trade_time_by_coin: dict[str, int] = {}
+        for trade in result.raw_trade_samples:
+            if not isinstance(trade, dict):
+                continue
+            coin = str(trade.get("coin") or "").upper()
+            price = _safe_float(trade.get("px"))
+            trade_time = _safe_int(trade.get("time")) or now_ms()
+            if not coin or price is None or price <= 0:
+                continue
+            if trade_time >= latest_trade_time_by_coin.get(coin, 0):
+                latest_prices_by_coin[coin] = price
+                latest_trade_time_by_coin[coin] = trade_time
         session.add(
             RawEvent(
                 source=result.source,
@@ -284,6 +304,25 @@ def store_public_trade_scan(
             )
         )
         result.raw_events_stored += 1
+        if latest_prices_by_coin:
+            session.add(
+                MarketSnapshot(
+                    source="publicTradesWS",
+                    exchange_ts=max(latest_trade_time_by_coin.values()) if latest_trade_time_by_coin else None,
+                    raw_json={
+                        "prices": latest_prices_by_coin,
+                        "trade_times_ms": latest_trade_time_by_coin,
+                        "source": result.source,
+                        "read_only": True,
+                    },
+                )
+            )
+            repo.update_source_health(
+                "market_marks_public_trades",
+                is_success=True,
+                is_heartbeat=True,
+                event_timestamp_ms=max(latest_trade_time_by_coin.values()) if latest_trade_time_by_coin else None,
+            )
 
     ranked = sorted(result.wallet_stats.values(), key=lambda item: item.score, reverse=True)
     for index, stats in enumerate(ranked, start=1):
@@ -318,20 +357,35 @@ def store_public_trade_scan(
             )
         )
         if index <= promote_top:
-            session.add(
-                TopWallet(
-                    wallet_address=stats.wallet_address,
-                    rank=index,
-                    source="public_trades_ws",
-                    score=stats.score,
-                    selected_at_ms=now_ms(),
-                    status="selected",
-                    notes=(
-                        "fresh_public_trades_ws;read_only;requires_/info_confirmation;"
-                        "not_a_trading_signal"
-                    ),
-                )
+            existing_top = (
+                session.query(TopWallet)
+                .filter(TopWallet.wallet_address == stats.wallet_address)
+                .filter(TopWallet.source == "public_trades_ws")
+                .order_by(TopWallet.score.desc(), TopWallet.selected_at_ms.desc())
+                .first()
             )
+            notes = (
+                "fresh_public_trades_ws;read_only;requires_/info_confirmation;"
+                "not_a_trading_signal"
+            )
+            if existing_top is not None:
+                existing_top.rank = index
+                existing_top.score = max(float(existing_top.score or 0.0), float(stats.score or 0.0))
+                existing_top.selected_at_ms = now_ms()
+                existing_top.status = "selected"
+                existing_top.notes = notes
+            else:
+                session.add(
+                    TopWallet(
+                        wallet_address=stats.wallet_address,
+                        rank=index,
+                        source="public_trades_ws",
+                        score=stats.score,
+                        selected_at_ms=now_ms(),
+                        status="selected",
+                        notes=notes,
+                    )
+                )
             result.wallets_stored += 1
     return result
 

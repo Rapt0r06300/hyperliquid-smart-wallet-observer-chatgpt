@@ -16,7 +16,7 @@ class SafetyAuditResult:
 
 
 TEXT_SUFFIXES = {".py", ".toml", ".yaml", ".yml", ".env", ".example", ".txt"}
-EXCLUDED_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", "logs"}
+EXCLUDED_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", "logs", "tmp_pytest"}
 
 
 def _iter_scannable_files(root: Path) -> list[Path]:

@@ -1,8 +1,8 @@
 # HyperSmart Archive Audit
 
 - status: OK
-- message: Runtime files excluded by clean archive: 539
-- latest_desktop_archive: C:\Users\flo\Desktop\Projet_invest_clean_20260526_183047.zip
+- message: Runtime files excluded by clean archive: 2429
+- latest_desktop_archive: C:\Users\flo\Desktop\Projet_invest_clean_20260607_190638.zip
 - latest_desktop_archive_clean: True
 - forbidden_entries_in_latest_archive: 0
 - clean archives must be created outside the project, preferably Desktop.

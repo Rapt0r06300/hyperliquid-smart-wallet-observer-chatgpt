@@ -22,9 +22,15 @@ from hyper_smart_observer.copy_mode.preflight import format_copy_preflight_repor
 from hyper_smart_observer.copy_mode.reports import format_copy_period_report, format_copy_run_report, write_copy_run_report
 from hyper_smart_observer.copy_mode.repository import insert_shortlist_entries, list_latest_signal_candidates, list_no_trade_decisions
 from hyper_smart_observer.dashboard.exporter import export_dashboard
+from hyper_smart_observer.consensus.position_consensus import build_position_consensus
+from hyper_smart_observer.data_sources.provider_registry import provider_registry_report
 from hyper_smart_observer.app.config import AppConfig, load_config
 from hyper_smart_observer.app.logging_config import configure_logging
 from hyper_smart_observer.app.safety import SafetyViolation, validate_runtime_config
+from hyper_smart_observer.local_index.index_benchmark import format_benchmark_report, run_local_scan_benchmark
+from hyper_smart_observer.local_index.query_engine import scan_wallet_index
+from hyper_smart_observer.local_index.wallet_index import WalletLocalIndex, fake_wallet
+from hyper_smart_observer.opportunities.opportunity_engine import evaluate_opportunity
 from hyper_smart_observer.paper_trading.reporting import format_paper_report
 from hyper_smart_observer.paper_trading.simulator import PaperTradingSimulator
 from hyper_smart_observer.patterns.pattern_detector import PatternDetector
@@ -32,12 +38,19 @@ from hyper_smart_observer.position_lifecycle.lifecycle_builder import build_life
 from hyper_smart_observer.position_lifecycle.position_reconstructor import action_from_fill_row
 from hyper_smart_observer.realtime_monitor.stream_models import StreamType
 from hyper_smart_observer.realtime_monitor.subscriptions import Subscription
+from hyper_smart_observer.realtime_monitor.hot_watch_rotation import rotate_hot_watch
 from hyper_smart_observer.realtime_monitor.websocket_manager import WebSocketManager
 from hyper_smart_observer.runtime.archive import archive_readiness, create_clean_archive, default_desktop_output_dir
 from hyper_smart_observer.runtime.runtime_check import format_runtime_report, scan_runtime_files
+from hyper_smart_observer.scanner.missed_opportunity_logger import MissedOpportunityLogger
 from hyper_smart_observer.scoring.ranking_report import format_ranking_report
 from hyper_smart_observer.scoring.smart_wallet_ranking import SmartWalletRankingEngine
 from hyper_smart_observer.scoring.wallet_score import WalletScoreEngine
+from hyper_smart_observer.scale.chunked_ingestion import ingest_jsonl_chunks
+from hyper_smart_observer.scale.dataset_profiler import profile_dataset
+from hyper_smart_observer.scale.scale_benchmark import format_scale_benchmark_report, run_scale_benchmark
+from hyper_smart_observer.simulation.diagnostic_log import write_simulation_engine_logs
+from hyper_smart_observer.simulation.scenario_runner import run_conservative_scenario
 from hyper_smart_observer.hyperliquid_client.models import Wallet
 from hyper_smart_observer.hyperliquid_client.validation import normalize_wallet_address
 from hyper_smart_observer.storage.database import get_connection, initialize_database
@@ -45,6 +58,7 @@ from hyper_smart_observer.storage.repositories import fills_repo, paper_trades_r
 from hyper_smart_observer.wallet_discovery.discovery_engine import WalletDiscoveryEngine
 from hyper_smart_observer.wallet_discovery.collector import HyperliquidReadOnlyCollector
 from hyper_smart_observer.wallet_discovery.wallet_importer import import_wallets_from_text
+from hyper_smart_observer.wallet_universe.wallet_universe import import_wallet_universe_file, import_wallet_universe_lines
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,8 +66,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["copy-preflight", "copy-run", "copy-report", "promote-testnet-candidates"],
-        help="Optional product command. All copy commands are dry-run/research only.",
+        choices=[
+            "benchmark-local-scan",
+            "scan-universe",
+            "scan-local",
+            "scan-warm",
+            "hot-watch",
+            "consensus-report",
+            "missed-opportunities",
+            "opportunity-report",
+            "simulate-magic-bot",
+            "simulation-report",
+            "dataset-profile",
+            "ingest-local-dataset",
+            "scale-benchmark",
+            "copy-preflight",
+            "copy-run",
+            "copy-report",
+            "promote-testnet-candidates",
+        ],
+        help="Optional product command. All commands are read-only or local simulation only.",
     )
     parser.add_argument("--status", action="store_true", help="Show safe runtime status.")
     parser.add_argument("--init-db", action="store_true", help="Initialize local SQLite database.")
@@ -104,6 +136,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shortlist-target-count", type=int, default=None, help="Target count for local shortlist selection.")
     parser.add_argument("--copy-max-leaders", type=int, default=None, help="Maximum shortlisted leaders observed in one copy-run.")
     parser.add_argument("--shortlist-output", default=None, help="Optional shortlist JSON output path.")
+    parser.add_argument("--wallets", type=int, default=2000, help="Number of local wallets for local benchmarks.")
+    parser.add_argument("--limit", type=int, default=None, help="Generic local command limit.")
+    parser.add_argument("--source", default="imports", help="Local scan/import source label.")
+    parser.add_argument("--capital", type=float, default=1000.0, help="Virtual no-money simulation capital.")
+    parser.add_argument("--scenario", default="conservative", help="Local no-money simulation scenario.")
+    parser.add_argument("--path", default=None, help="Local dataset file or directory path.")
+    parser.add_argument("--chunk-size", type=int, default=50_000, help="Local ingestion chunk size.")
+    parser.add_argument("--events", type=int, default=1_000_000, help="Synthetic local events for scale benchmark.")
     parser.add_argument("--enrich-wallet", action="append", default=[], help="Enrich one wallet from local data.")
     parser.add_argument("--rank-wallets", action="store_true", help="Build research-only smart wallet rankings from stored scores.")
     parser.add_argument("--list-top-wallets", action="store_true", help="List stored research wallet scores.")
@@ -153,6 +193,172 @@ def main(argv: list[str] | None = None) -> int:
     except SafetyViolation as exc:
         print(f"Safety refused: {exc.reason_code} - {exc}")
         return 2
+
+    if args.command == "benchmark-local-scan":
+        result = run_local_scan_benchmark(args.wallets)
+        print(format_benchmark_report(result))
+        print("scope=local_index_only; no network; no order")
+        return 0
+
+    if args.command == "scan-local":
+        limit = max(0, args.limit or 2_000)
+        index = WalletLocalIndex()
+        for i in range(limit):
+            index.upsert(fake_wallet(i + 1))
+        summary = scan_wallet_index(index, limit=limit)
+        print("scan_local=research_only_no_network")
+        print(f"wallets_scanned={summary.wallets_scanned}")
+        print(f"rejected_count={summary.rejected_count}")
+        print(f"stopped_reason={summary.stopped_reason}")
+        for wallet in summary.top_wallets:
+            print(
+                f"{wallet.wallet_address} | priority={wallet.priority_hint} | "
+                f"trades={wallet.trades_count} | pnl={wallet.closed_pnl_usdt} | active={wallet.active_positions}"
+            )
+        return 0
+
+    if args.command == "scan-universe":
+        limit = max(0, args.limit or 1_000)
+        if args.import_wallets_file:
+            result = import_wallet_universe_file(Path(args.import_wallets_file), source=args.source)
+        else:
+            lines = [f"0x{i:040x}" for i in range(1, limit + 1)]
+            result = import_wallet_universe_lines(lines, source="local_fixture")
+        print("scan_universe=local_only")
+        print(f"source={args.source}")
+        print(f"imported={result.imported}")
+        print(f"duplicates={result.duplicates}")
+        print(f"rejected={result.rejected}")
+        if result.rejected_reasons:
+            print(f"rejected_reasons={','.join(result.rejected_reasons[:10])}")
+        for entry in result.entries[:10]:
+            print(f"{entry.wallet_address} | status={entry.status} | priority={entry.scan_priority}")
+        return 0
+
+    if args.command == "scan-warm":
+        if not args.network_read:
+            print("Safety refused: NETWORK_READ_DISABLED - scan-warm requires explicit --network-read.")
+            return 2
+        report = run_copy_preflight(config, network_read=True, max_leaders=args.limit or args.copy_max_leaders)
+        print("scan_warm_preflight=read_only_info_budget")
+        print(format_copy_preflight_report(report))
+        return 0
+
+    if args.command == "hot-watch":
+        if not args.network_read:
+            print("Safety refused: NETWORK_READ_DISABLED - hot-watch requires explicit --network-read.")
+            return 2
+        duration = args.duration_seconds or args.monitor_duration_seconds
+        if duration is None or duration <= 0:
+            print("Safety refused: WEBSOCKET_DURATION_REQUIRED - hot-watch requires --duration-seconds.")
+            return 2
+        if not args.dry_run:
+            print("Safety refused: DRY_RUN_REQUIRED - hot-watch is dry-run/read-only in this batch.")
+            return 2
+        candidates = [(fake_wallet(i + 1).wallet_address, float(100 - i), 1_800_000_000_000 - i) for i in range(args.limit or 25)]
+        slots = rotate_hot_watch(candidates, now_ms=1_800_000_000_000, max_slots=10, slot_ttl_ms=duration * 1000)
+        print("hot_watch=read_only_dry_run")
+        print(f"duration_seconds={duration}")
+        print(f"slots={len(slots)}")
+        for slot in slots:
+            print(f"{slot.slot_id} | {slot.wallet_address} | priority={slot.priority} | reason={slot.reason}")
+        return 0
+
+    if args.command == "consensus-report":
+        events = [
+            {"wallet": f"0x{i:040x}", "coin": "BTC", "direction": "LONG", "action_type": "OPEN_LONG", "wallet_score": 80 + i, "notional": 50}
+            for i in range(1, 4)
+        ]
+        snapshots = build_position_consensus(events, timestamp_ms=1_800_000_000_000)
+        print(f"consensus_report_period={args.period}")
+        print("research_only=true")
+        for snapshot in snapshots:
+            print(
+                f"{snapshot.coin} {snapshot.direction} {snapshot.action_type} | wallets={snapshot.wallet_count} | "
+                f"high_quality={snapshot.high_quality_wallet_count} | strength={snapshot.consensus_strength}"
+            )
+        return 0
+
+    if args.command == "opportunity-report":
+        events = [
+            {"wallet": f"0x{i:040x}", "coin": "BTC", "direction": "LONG", "action_type": "OPEN_LONG", "wallet_score": 85 + i, "notional": 50}
+            for i in range(1, 4)
+        ]
+        snapshots = build_position_consensus(events, timestamp_ms=1_800_000_000_000)
+        print(f"opportunity_report_period={args.period}")
+        print("research_only=true; accepted means simulation only")
+        for snapshot in snapshots:
+            opportunity = evaluate_opportunity(snapshot, created_at_ms=snapshot.timestamp_ms, current_mid=50_000.0, expected_edge_bps=25.0)
+            print(
+                f"{opportunity.coin} {opportunity.action_type} | decision={opportunity.decision} | "
+                f"edge_remaining_bps={opportunity.edge_remaining_bps} | reasons={','.join(opportunity.refusal_reasons) or 'none'}"
+            )
+        return 0
+
+    if args.command == "missed-opportunities":
+        logger = MissedOpportunityLogger()
+        print(logger.report(period=args.period))
+        return 0
+
+    if args.command == "simulate-magic-bot":
+        if args.scenario != "conservative":
+            print("Simulation refused: UNKNOWN_SCENARIO - only conservative local no-money scenario is available.")
+            return 2
+        result = run_conservative_scenario(capital=args.capital)
+        log_paths = write_simulation_engine_logs(result.engine, project_root=Path(config.runtime_root), title="cli_simulation")
+        print(result.report)
+        print(f"diagnostic_logs: {log_paths['directory']}")
+        print(f"chatgpt_log: {log_paths['chatgpt_markdown']}")
+        if log_paths.get("write_warnings"):
+            print(f"log_write_warnings: {log_paths['write_warnings']}")
+        return 0
+
+    if args.command == "simulation-report":
+        result = run_conservative_scenario(capital=1000.0)
+        log_paths = write_simulation_engine_logs(result.engine, project_root=Path(config.runtime_root), title="cli_simulation")
+        print(f"simulation_report_period={args.period}")
+        print(result.report)
+        print(f"diagnostic_logs: {log_paths['directory']}")
+        print(f"chatgpt_log: {log_paths['chatgpt_markdown']}")
+        if log_paths.get("write_warnings"):
+            print(f"log_write_warnings: {log_paths['write_warnings']}")
+        return 0
+
+    if args.command == "dataset-profile":
+        if not args.path:
+            print("Dataset profile refused: CONFIGURATION_REFUSED - --path is required.")
+            return 2
+        profile = profile_dataset(Path(args.path))
+        print("dataset_profile=local_only_no_network")
+        print(f"path={profile.path}")
+        print(f"exists={str(profile.exists).lower()}")
+        print(f"files={profile.files}")
+        print(f"bytes_total={profile.bytes_total}")
+        print(f"sampled_rows={profile.sampled_rows}")
+        print(f"detected_columns={','.join(profile.detected_columns)}")
+        print(f"network_used={str(profile.network_used).lower()}")
+        print(f"stopped_reason={profile.stopped_reason}")
+        return 0
+
+    if args.command == "ingest-local-dataset":
+        if not args.path:
+            print("Local ingestion refused: CONFIGURATION_REFUSED - --path is required.")
+            return 2
+        result = ingest_jsonl_chunks(Path(args.path), chunk_size=args.chunk_size)
+        print("ingest_local_dataset=jsonl_chunks_no_network")
+        print(f"path={result.path}")
+        print(f"rows_seen={result.rows_seen}")
+        print(f"chunks_committed={result.chunks_committed}")
+        print(f"checkpoint_row={result.checkpoint_row}")
+        print(f"network_used={str(result.network_used).lower()}")
+        print(f"stopped_reason={result.stopped_reason}")
+        return 0
+
+    if args.command == "scale-benchmark":
+        result = run_scale_benchmark(wallets=args.wallets, events=args.events)
+        print(format_scale_benchmark_report(result))
+        print("scope=synthetic_local_scale; no network; no order")
+        return 0
 
     if args.command == "copy-run":
         interval = args.interval or config.copy_poll_interval_seconds

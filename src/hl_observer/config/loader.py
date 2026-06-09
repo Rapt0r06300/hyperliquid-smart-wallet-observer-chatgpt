@@ -42,7 +42,12 @@ def _load_yaml(path: Path | None) -> dict[str, Any]:
 
 
 def load_settings(config_path: str | Path | None = None) -> Settings:
-    raw = _load_yaml(Path(config_path) if config_path else Path("config/settings.example.yaml"))
+    if config_path:
+        path = Path(config_path)
+    else:
+        custom_path = Path("config/settings.yaml")
+        path = custom_path if custom_path.exists() else Path("config/settings.example.yaml")
+    raw = _load_yaml(path)
     app_raw = raw.get("app", {}) if isinstance(raw.get("app", {}), dict) else {}
     hl_raw = raw.get("hyperliquid", {}) if isinstance(raw.get("hyperliquid", {}), dict) else {}
     collection_raw = raw.get("collection", {}) if isinstance(raw.get("collection", {}), dict) else {}

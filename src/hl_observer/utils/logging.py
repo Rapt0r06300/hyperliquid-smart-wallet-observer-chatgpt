@@ -31,6 +31,8 @@ def configure_logging(level: str = "INFO") -> None:
     handler.setFormatter(JsonFormatter())
     root.addHandler(handler)
     root.setLevel(level.upper())
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:

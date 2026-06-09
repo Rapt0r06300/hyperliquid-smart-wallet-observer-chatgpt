@@ -15,3 +15,12 @@ Scope delivered:
 - automated safety audit.
 
 Release posture: research-only, local paper simulation only, no execution.
+## Current release-candidate delta
+
+- Added OSINT/claims research.
+- Added provider registry.
+- Added local-index benchmark.
+- Added scanner priority report.
+- Added missed-opportunity reports.
+- Added hot-watch rotation planning.
+- Full test suite must remain green before release.

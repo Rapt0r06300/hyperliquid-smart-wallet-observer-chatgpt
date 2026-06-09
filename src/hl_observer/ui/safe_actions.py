@@ -1062,7 +1062,7 @@ async def _run_selected_wallet_backfill(
             include_fills_by_time=True,
             include_open_orders=True,
             include_frontend_open_orders=True,
-            include_market_snapshots=False,
+            include_market_snapshots=True,
             rebuild_positions=True,
             compute_position_deltas=True,
         ),

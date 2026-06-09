@@ -228,49 +228,61 @@ def decisions_from_signal(signal: SignalCandidate) -> list[NoTradeDecision]:
 
 
 def write_no_trade_reports(decisions: list[NoTradeDecision], output_dir: Path) -> tuple[Path, Path]:
-    output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "no_trade_report.json"
     md_path = output_dir / "no_trade_report.md"
     csv_path = output_dir / "no_trade_report.csv"
-    json_path.write_text(json.dumps(to_jsonable(decisions), indent=2, sort_keys=True), encoding="utf-8")
-    md_path.write_text(format_no_trade_markdown(decisions), encoding="utf-8")
-    with csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "decision_id",
-                "created_at",
-                "reason",
-                "risk_level",
-                "component",
-                "leader_wallet",
-                "coin",
-                "candidate_id",
-                "observed",
-                "why_not_simulable",
-                "missing_data",
-                "next_action",
-            ],
-        )
-        writer.writeheader()
-        for decision in decisions:
-            writer.writerow(
-                {
-                    "decision_id": decision.decision_id,
-                    "created_at": decision.created_at.isoformat(),
-                    "reason": decision.reason.value,
-                    "risk_level": decision.risk_level,
-                    "component": decision.component,
-                    "leader_wallet": decision.leader_wallet,
-                    "coin": decision.coin,
-                    "candidate_id": decision.candidate_id,
-                    "observed": decision.observed,
-                    "why_not_simulable": decision.why_not_simulable,
-                    "missing_data": decision.missing_data,
-                    "next_action": decision.next_action,
-                }
+    _safe_write_text(json_path, json.dumps(to_jsonable(decisions), indent=2, sort_keys=True))
+    _safe_write_text(md_path, format_no_trade_markdown(decisions))
+    try:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "decision_id",
+                    "created_at",
+                    "reason",
+                    "risk_level",
+                    "component",
+                    "leader_wallet",
+                    "coin",
+                    "candidate_id",
+                    "observed",
+                    "why_not_simulable",
+                    "missing_data",
+                    "next_action",
+                ],
             )
+            writer.writeheader()
+            for decision in decisions:
+                writer.writerow(
+                    {
+                        "decision_id": decision.decision_id,
+                        "created_at": decision.created_at.isoformat(),
+                        "reason": decision.reason.value,
+                        "risk_level": decision.risk_level,
+                        "component": decision.component,
+                        "leader_wallet": decision.leader_wallet,
+                        "coin": decision.coin,
+                        "candidate_id": decision.candidate_id,
+                        "observed": decision.observed,
+                        "why_not_simulable": decision.why_not_simulable,
+                        "missing_data": decision.missing_data,
+                        "next_action": decision.next_action,
+                    }
+                )
+    except OSError:
+        pass
     return json_path, md_path
+
+
+def _safe_write_text(path: Path, text: str) -> str | None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return f"{path}: {exc.__class__.__name__}: {exc}"
+    return None
 
 
 def format_no_trade_markdown(decisions: list[NoTradeDecision]) -> str:

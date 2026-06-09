@@ -93,6 +93,32 @@ def test_copy_signal_detector_requires_positive_edge_remaining():
     assert report.no_trade_reasons["edge_remaining_bps_non_positive"] == 1
 
 
+def test_copy_signal_detector_uses_live_simulation_age_window(monkeypatch):
+    settings = _settings()
+    settings.risk.max_signal_age_ms = 3_000
+    stale_without_override = detect_copy_signals_from_deltas(
+        [_delta("open_long", detected_at_ms=1_000)],
+        settings=settings,
+        followed_wallets=[_leader()],
+        now_timestamp_ms=11_000,
+        tuning=CopySignalTuning(leader_expected_move_bps=70.0),
+    )
+    monkeypatch.setenv("HYPERSMART_SIMULATION_MAX_SIGNAL_AGE_MS", "20000")
+    accepted_with_override = detect_copy_signals_from_deltas(
+        [_delta("open_long", detected_at_ms=1_000)],
+        settings=settings,
+        followed_wallets=[_leader()],
+        now_timestamp_ms=11_000,
+        tuning=CopySignalTuning(leader_expected_move_bps=70.0),
+    )
+
+    assert stale_without_override.signals[0].decision == SignalDecision.REJECT_TOO_LATE
+    assert accepted_with_override.signals[0].decision in {
+        SignalDecision.PAPER_TRADE,
+        SignalDecision.PAPER_CANDIDATE,
+    }
+
+
 def test_copy_signal_detector_ignores_unfollowed_wallet():
     report = detect_copy_signals_from_deltas(
         [_delta("open_long", wallet="0x" + "2" * 40)],

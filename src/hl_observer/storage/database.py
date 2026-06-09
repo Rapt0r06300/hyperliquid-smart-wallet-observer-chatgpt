@@ -14,16 +14,33 @@ class Base(DeclarativeBase):
 
 
 def create_sqlite_engine(database_url: str = "sqlite:///./data/hl_observer.sqlite3") -> Engine:
+    database_url = _normalize_sqlite_database_url(database_url)
     connect_args = {}
     if database_url.startswith("sqlite:///"):
         db_path = Path(database_url.removeprefix("sqlite:///"))
         if str(db_path) != ":memory:":
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            connect_args = {"timeout": 30}
+            connect_args = {"timeout": 60, "check_same_thread": False}
     engine = create_engine(database_url, future=True, connect_args=connect_args)
     if database_url.startswith("sqlite:///") and ":memory:" not in database_url:
         _configure_sqlite_runtime(engine)
     return engine
+
+
+def _normalize_sqlite_database_url(database_url: str) -> str:
+    """Resolve relative SQLite paths from the project root, not caller cwd."""
+
+    prefix = "sqlite:///"
+    if not database_url.startswith(prefix) or database_url == "sqlite:///:memory:":
+        return database_url
+    raw_path = database_url.removeprefix(prefix)
+    if raw_path == ":memory:":
+        return database_url
+    db_path = Path(raw_path)
+    if not db_path.is_absolute():
+        project_root = Path(__file__).resolve().parents[3]
+        db_path = project_root / db_path
+    return prefix + db_path.resolve().as_posix()
 
 
 def _configure_sqlite_runtime(engine: Engine) -> None:
@@ -33,7 +50,9 @@ def _configure_sqlite_runtime(engine: Engine) -> None:
         try:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute("PRAGMA busy_timeout=60000")
+            cursor.execute("PRAGMA temp_store=MEMORY")
+            cursor.execute("PRAGMA wal_autocheckpoint=1000")
         finally:
             cursor.close()
 

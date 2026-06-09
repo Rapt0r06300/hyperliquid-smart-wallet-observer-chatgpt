@@ -13,7 +13,8 @@ def format_copy_run_report(
     lines = [
         "copy-run dry-run report",
         "mode: PAPER mock USDC only",
-        "real orders: 0",
+        "real Hyperliquid orders: 0",
+        "virtual simulation positions: opened/closed only when paper gates pass",
         "testnet execution: locked",
         f"poll interval seconds: {signals.interval_seconds}",
     ]
@@ -28,7 +29,7 @@ def format_copy_run_report(
         [
             f"deltas seen: {signals.deltas_seen}",
             f"signals created: {signals.signals_created}",
-            f"paper candidates: {signals.paper_candidates}",
+            f"virtual entries accepted locally: {signals.paper_candidates}",
             f"rejected: {signals.rejected}",
         ]
     )
@@ -66,4 +67,3 @@ def format_copy_status_report(
         "no live orders, no mainnet, no testnet execution by default",
     ]
     return "\n".join(lines)
-

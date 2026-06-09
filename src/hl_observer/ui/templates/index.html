@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Hyperliquid Smart-Wallet Observer - Command Center</title>
-    <link rel="stylesheet" href="/static/app.css" />
+    <link rel="stylesheet" href="/static/app.css?v=simulation-ui-20260603-audit-compact-v4" />
   </head>
   <body>
     <div class="scanline"></div>
@@ -34,17 +34,19 @@
       <section class="panel data-watch hero-simulation" id="simulationPanel">
         <div class="panel-title">
           <span class="dot green pulse"></span>
-          <h2>P&L bot en simulation</h2>
+          <h2>Simulation du bot - gain/perte</h2>
         </div>
         <p class="section-help">
           Vue principale volontairement reduite au resultat du bot simule. Le P&L demarre a 0, ignore les anciens evenements,
-          et bouge seulement sur ouvertures/fermetures fraiches detectees apres le lancement. Aucun ordre, aucun mainnet.
+          et bouge seulement sur positions virtuelles ouvertes/fermees apres le lancement. Aucune execution reelle, aucun mainnet.
         </p>
         <div class="simulation-summary" id="simulationSummary">
-          <div class="simulation-metric"><span>P&L bot</span><strong>$0.00</strong></div>
-          <div class="simulation-metric"><span>Capital</span><strong>+$1000.00 USDT</strong></div>
-          <div class="simulation-metric"><span>Latent</span><strong>$0.00</strong></div>
-          <div class="simulation-metric"><span>Realise</span><strong>$0.00</strong></div>
+          <div class="simulation-metric"><span>Gain/perte session</span><strong>$0.00</strong></div>
+          <div class="simulation-metric"><span>Solde fictif actuel</span><strong>$1000.00 USDT</strong></div>
+          <div class="simulation-metric"><span>Gain/perte encaisse</span><strong>$0.00</strong></div>
+          <div class="simulation-metric"><span>Gain/perte en cours</span><strong>$0.00</strong></div>
+          <div class="simulation-metric"><span>Capital utilise</span><strong>$0.00 / libre $1000.00</strong></div>
+          <div class="simulation-metric"><span>Journal decisions</span><strong>$0.00 / 0 evts</strong></div>
         </div>
         <div class="simulation-live-strip" id="simulationLiveStrip">
           <div class="simulation-live-pill orange"><span>Etat</span><strong>Connexion a la simulation locale...</strong></div>
@@ -53,7 +55,7 @@
           <div class="metagraph-header">
             <div>
               <p class="eyebrow">Metagraphe local</p>
-              <h3>P&L du bot simule</h3>
+              <h3>Gain/perte du bot simule</h3>
             </div>
             <span id="simulationGraphState" class="badge cyan">En attente de donnees</span>
           </div>
@@ -69,6 +71,10 @@
             <article>
               <h3>Wallets suivis</h3>
               <div id="simulationWalletsFeed" class="feed"></div>
+            </article>
+            <article>
+              <h3>Donnees fraiches</h3>
+              <div id="simulationFreshFeed" class="feed"></div>
             </article>
             <article>
               <h3>Consensus positions</h3>
@@ -347,6 +353,6 @@
         <pre id="logConsole"></pre>
       </section>
     </main>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=simulation-ui-20260603-audit-compact-v4"></script>
   </body>
 </html>

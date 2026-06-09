@@ -7,22 +7,23 @@ from dataclasses import dataclass, field
 class RealtimeCopyRiskConfig:
     """Pessimistic local scoring config for realtime copy simulation only."""
 
-    min_edge_required_bps: float = 8.0
-    max_signal_age_ms: int = 10 * 60_000
+    min_edge_required_bps: float = 25.0
+    max_signal_age_ms: int = 4_000
     fee_bps: float = 4.0
     spread_bps: float = 3.0
     slippage_bps: float = 5.0
-    latency_cost_bps_per_minute: float = 1.5
-    max_latency_cost_bps: float = 18.0
-    adverse_selection_penalty_bps: float = 3.0
+    latency_cost_bps_per_minute: float = 1.0
+    max_latency_cost_bps: float = 12.0
+    adverse_selection_penalty_bps: float = 2.0
     funding_penalty_bps: float = 0.0
-    min_liquidity_score: float = 0.20
+    min_liquidity_score: float = 0.35
     low_liquidity_penalty_bps: float = 4.0
-    single_wallet_penalty_bps: float = 6.0
+    single_wallet_penalty_bps: float = 3.0
+    single_wallet_min_edge_required_bps: float = 30.0
     crowding_penalty_start_wallets: int = 5
     crowding_penalty_bps_per_wallet: float = 2.0
-    max_copy_degradation_bps: float = 35.0
-    max_price_deviation_bps: float = 30.0
+    max_copy_degradation_bps: float = 18.0
+    max_price_deviation_bps: float = 8.0
     starting_equity_usdt: float = 1000.0
     max_position_notional_usdt: float = 50.0
     min_position_notional_usdt: float = 5.0
@@ -156,6 +157,8 @@ def score_realtime_copy_candidate(
     )
     if edge_remaining_bps < cfg.min_edge_required_bps:
         reasons.append("EDGE_REMAINING_TOO_LOW")
+    if inputs.consensus_wallets < 2 and edge_remaining_bps < cfg.single_wallet_min_edge_required_bps:
+        reasons.append("SINGLE_WALLET_EDGE_TOO_LOW")
     if edge_remaining_bps <= 0:
         warnings.append("EDGE_NON_POSITIVE_AFTER_COSTS")
 

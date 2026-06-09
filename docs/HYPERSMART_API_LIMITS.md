@@ -17,6 +17,21 @@ Configured defaults:
 - `HYPERSMART_MAX_PAGES_PER_WALLET=5`
 - `HYPERSMART_MAX_FILLS_PER_RUN=10000`
 
+Official points verified on 2026-06-02:
+
+- Time-range responses return only 500 elements or distinct blocks per response;
+  the next request must resume from the last returned timestamp.
+- `userFills` returns at most 2000 recent fills.
+- `userFillsByTime` returns at most 2000 fills per response and only the 10000
+  most recent fills are available.
+- REST requests share 1200 aggregated weight per minute per IP.
+- `l2Book`, `allMids`, `clearinghouseState`, `orderStatus`,
+  `spotClearinghouseState` and `exchangeStatus` have low documented info
+  weight; most other info requests are heavier.
+- `userFills`, `userFillsByTime`, `historicalOrders` and other large endpoints
+  have additional weight per 20 returned items.
+- Explorer API requests have weight 40 and must remain secondary/experimental.
+
 The official Hyperliquid rate-limit documentation describes a shared REST
 weight limit of 1200 per minute per IP. It also documents extra weight buckets
 for response-heavy `/info` methods, including `userFills` and

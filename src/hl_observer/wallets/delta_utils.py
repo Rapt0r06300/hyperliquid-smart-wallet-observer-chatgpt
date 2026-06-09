@@ -52,7 +52,7 @@ def copy_delta_direction(row: PositionDeltaModel, action: str | None = None) -> 
 
 
 def delta_event_time_ms(row: PositionDeltaModel) -> int:
-    return int(row.exchange_ts or row.detected_at_ms or 0)
+    return int(row.detected_at_ms or row.exchange_ts or 0)
 
 
 def build_position_consensus(

@@ -11,14 +11,18 @@ from hl_observer.utils.time import now_ms
 
 STATE_VERSION = 1
 STATE_FILENAME = "ui_simulation_state.json"
-MAX_PERSISTED_LEDGER_EVENTS = 2_000
+MAX_PERSISTED_LEDGER_EVENTS = 20_000
 MAX_PERSISTED_DELTA_KEYS = 10_000
+MAX_PERSISTED_EQUITY_POINTS = 5_000
 
 
 def simulation_state_path(settings: Settings) -> Path:
     db_path = _sqlite_path_from_url(settings.database_url)
     if db_path is not None:
-        return db_path.parent / "runtime" / STATE_FILENAME
+        db_parent = db_path.parent
+        if db_parent.name.lower() == "data" and db_parent.parent.name.lower() == "runtime":
+            return db_parent / STATE_FILENAME
+        return db_parent / "runtime" / STATE_FILENAME
     return Path("data") / "runtime" / STATE_FILENAME
 
 
@@ -30,7 +34,34 @@ def load_or_create_ui_state(settings: Settings) -> UiState:
         if loaded is not None:
             return loaded
     state = UiState()
-    persist_simulation_state(settings, state)
+    try:
+        persist_simulation_state(settings, state)
+    except OSError as exc:
+        state.add_event(
+            "simulation_state_persist_unavailable",
+            "Etat simulation non persiste: le dossier runtime n'est pas inscriptible.",
+            payload={"state_path": str(path), "error": str(exc)},
+        )
+    return state
+
+
+def reset_simulation_state(settings: Settings, *, starting_equity_usdt: float = 1000.0) -> UiState:
+    """Start a fresh launcher session while keeping the reset local and explicit."""
+
+    state = UiState()
+    state.simulation_started_at_ms = now_ms()
+    state.simulation_starting_equity_usdt = max(1.0, float(starting_equity_usdt))
+    state.simulation_equity_history = [
+        _initial_equity_point(state.simulation_started_at_ms, state.simulation_starting_equity_usdt)
+    ]
+    try:
+        persist_simulation_state(settings, state)
+    except OSError as exc:
+        state.add_event(
+            "simulation_state_persist_unavailable",
+            "Etat simulation non persiste apres reset: le dossier runtime n'est pas inscriptible.",
+            payload={"state_path": str(simulation_state_path(settings)), "error": str(exc)},
+        )
     return state
 
 
@@ -44,6 +75,12 @@ def persist_simulation_state(settings: Settings, state: UiState) -> Path:
         "simulation_processed_delta_keys": sorted(state.simulation_processed_delta_keys)[-MAX_PERSISTED_DELTA_KEYS:],
         "simulation_virtual_positions": _safe_position_payload(state.simulation_virtual_positions),
         "simulation_ledger_events": _safe_ledger_payload(state.simulation_ledger_events),
+        "simulation_realized_pnl_usdc": float(state.simulation_realized_pnl_usdc),
+        "simulation_entry_costs_paid_usdc": float(state.simulation_entry_costs_paid_usdc),
+        "simulation_exit_costs_paid_usdc": float(state.simulation_exit_costs_paid_usdc),
+        "simulation_reproduced_entries_total": int(state.simulation_reproduced_entries_total),
+        "simulation_reproduced_exits_total": int(state.simulation_reproduced_exits_total),
+        "simulation_equity_history": _safe_equity_history_payload(state.simulation_equity_history),
         "updated_at_ms": now_ms(),
         "runtime_only": True,
         "notes": "Local UI simulation session state. No secrets, no orders.",
@@ -80,6 +117,18 @@ def _load_state_file(path: Path) -> UiState | None:
         state.simulation_ledger_events = [
             item
             for item in ledger[-MAX_PERSISTED_LEDGER_EVENTS:]
+            if isinstance(item, dict)
+        ]
+    state.simulation_realized_pnl_usdc = _safe_float(payload.get("simulation_realized_pnl_usdc")) or 0.0
+    state.simulation_entry_costs_paid_usdc = _safe_float(payload.get("simulation_entry_costs_paid_usdc")) or 0.0
+    state.simulation_exit_costs_paid_usdc = _safe_float(payload.get("simulation_exit_costs_paid_usdc")) or 0.0
+    state.simulation_reproduced_entries_total = _safe_int(payload.get("simulation_reproduced_entries_total")) or 0
+    state.simulation_reproduced_exits_total = _safe_int(payload.get("simulation_reproduced_exits_total")) or 0
+    equity_history = payload.get("simulation_equity_history")
+    if isinstance(equity_history, list):
+        state.simulation_equity_history = [
+            item
+            for item in equity_history[-MAX_PERSISTED_EQUITY_POINTS:]
             if isinstance(item, dict)
         ]
     state.add_event(
@@ -140,3 +189,30 @@ def _safe_ledger_payload(events: list[dict]) -> list[dict]:
             }
         )
     return safe_events
+
+
+def _safe_equity_history_payload(points: list[dict]) -> list[dict]:
+    safe_points: list[dict] = []
+    for point in points[-MAX_PERSISTED_EQUITY_POINTS:]:
+        if not isinstance(point, dict):
+            continue
+        safe_points.append(
+            {
+                key: value
+                for key, value in point.items()
+                if isinstance(value, (str, int, float, bool)) or value is None
+            }
+        )
+    return safe_points
+
+
+def _initial_equity_point(timestamp_ms: int, starting_equity_usdt: float) -> dict[str, float | int | str]:
+    return {
+        "timestamp_ms": int(timestamp_ms),
+        "current_pnl_usdc": 0.0,
+        "current_equity_usdt": float(starting_equity_usdt),
+        "realized_pnl_usdc": 0.0,
+        "unrealized_pnl_usdc": 0.0,
+        "open_exposure_usdt": 0.0,
+        "source": "SESSION_START",
+    }

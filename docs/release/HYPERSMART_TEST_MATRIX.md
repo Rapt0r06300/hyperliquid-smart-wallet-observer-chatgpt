@@ -17,3 +17,11 @@ Areas:
 - safety audit.
 
 All tests are designed to run without Internet.
+## Docs-to-code checklist
+
+- [x] Full pytest suite runs.
+- [x] HyperSmart targeted tests run.
+- [x] Scanner/local-index tests added.
+- [ ] Dashboard screenshot smoke test for new scanner sections.
+- [ ] Local benchmark regression threshold in CI.
+- [ ] Provider registry contract tests for all future providers.

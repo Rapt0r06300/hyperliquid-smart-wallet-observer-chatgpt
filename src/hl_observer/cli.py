@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 import typer
 
 from hl_observer.autoscan import format_autoscan_report, run_autoscan
@@ -19,11 +24,21 @@ from hl_observer.copying.leaderboard_autoselect import (
     CopyLeaderAutoSelectConfig,
     select_copy_leaders,
 )
+from hl_observer.copying.consensus_leader_selector import (
+    ConsensusLeaderSelectionReport,
+    format_consensus_leader_report,
+    select_consensus_leaders_from_deltas,
+)
 from hl_observer.copying.reports import (
     format_copy_run_report,
     format_copy_status_report,
 )
+from hl_observer.copying.realtime_magic_score import RealtimeCopyRiskConfig
 from hl_observer.copying.signal_detector import CopySourceMode, detect_copy_signals_from_deltas
+from hl_observer.dashboard_truth.dashboard_truth_audit import (
+    format_dashboard_truth_audit,
+    run_dashboard_truth_audit,
+)
 from hl_observer.edge.edge_remaining import compute_edge_remaining
 from hl_observer.explorer.explorer_revalidation import revalidate_explorer_wallets
 from hl_observer.explorer.explorer_source import (
@@ -35,6 +50,33 @@ from hl_observer.explorer.explorer_source import (
 from hl_observer.explorer.explorer_transaction_tape import format_explorer_tape, get_explorer_tape
 from hl_observer.hyperliquid.endpoints import info_url_for_settings
 from hl_observer.hyperliquid.schemas import EdgeRemainingInputs, RiskDecision, SignalDecision
+from hl_observer.data_sources.provider_registry import provider_registry_report
+from hl_observer.data_sources.acquisition_engine import (
+    DataQualityConfig,
+    DataQualityGate,
+    FetchRequest,
+    FetchResult,
+    RequestBudgetManager,
+    format_data_quality_assessment,
+)
+from hl_observer.data_sources.historical_backfill_engine import (
+    HistoricalBackfillConfig,
+    HistoricalBackfillEngine,
+    TtlPageCache,
+    format_historical_backfill_result,
+)
+from hl_observer.data_sources.fresh_data_plan import (
+    FreshDataPlanRequest,
+    build_fresh_data_plan,
+    format_fresh_data_plan,
+)
+from hl_observer.data_sources.warehouse_coverage import (
+    build_warehouse_coverage_report,
+    format_warehouse_coverage_report,
+)
+from hl_observer.local_index.index_benchmark import format_benchmark_report, run_local_scan_benchmark
+from hl_observer.local_index.query_engine import scan_wallet_index
+from hl_observer.local_index.wallet_index import WalletLocalIndex, fake_wallet
 from hl_observer.markets.scanner import (
     MarketDiscoveryPlan,
     MarketScanPlan,
@@ -43,12 +85,108 @@ from hl_observer.markets.scanner import (
     run_discover_markets,
     run_scan_markets,
 )
+from hl_observer.opportunities.fresh_opportunity import (
+    find_fresh_opportunities,
+    format_fresh_opportunity_report,
+)
 from hl_observer.paper.paper_executor import PaperExecutor
 from hl_observer.risk.gates import RiskContext
 from hl_observer.risk.risk_engine import RiskEngine
 from hl_observer.runtime.hygiene import format_runtime_hygiene_report, scan_runtime_hygiene
+from hl_observer.runtime.write_diagnostics import (
+    check_runtime_write_readiness,
+    format_runtime_write_readiness,
+)
+from hl_observer.scanner.missed_opportunity_logger import write_missed_opportunity_reports
+from hl_observer.scanner.priority_queue import select_wallets_for_warm_scan
+from hl_observer.scanner.scan_budget import evaluate_warm_scan_budget
+from hl_observer.scanner.scanner_models import ScanBudget, WalletPriorityInput
+from hl_observer.scanner.throughput_planner import (
+    ThroughputRequest,
+    format_throughput_plan,
+    plan_safe_high_throughput_scan,
+)
+from hl_observer.scanner.fresh_scan_strategy import (
+    FreshScanStrategyRequest,
+    format_fresh_scan_strategy,
+    plan_fresh_scan_strategy,
+)
+from hl_observer.scanner.wallet_priority import score_wallet_priority
+from hl_observer.realtime_monitor.hot_watch_rotation import rotate_hot_watch
+from hl_observer.realtime.realtime_health import check_realtime_health, format_realtime_health
+from hl_observer.realtime.recovery_engine import (
+    RealtimeRecoveryEngine,
+    ReconnectPolicy,
+    StreamEventType,
+    WatchStreamEvent,
+    format_recovery_decision,
+)
+from hl_observer.realtime.latency_report import build_latency_report, format_latency_report
+from hl_observer.realtime.replay import format_replay_result, replay_events_from_logs
+from hl_observer.realtime.freshness_diagnostics import (
+    build_freshness_diagnostics,
+    format_freshness_diagnostics,
+)
+from hl_observer.metagraph.metagraph_export import export_metagraph_from_logs, format_metagraph_export
+from hl_observer.research.manual_research_classifier import (
+    classify_manual_research,
+    format_classified_research,
+    format_feature_map,
+    write_research_to_feature_map,
+)
+from hl_observer.research.manual_research_importer import (
+    format_manual_research_import,
+    import_manual_research,
+    write_manual_research_template,
+)
+from hl_observer.release.closeout import write_closeout_report
+from hl_observer.release.prompt_coverage import (
+    evaluate_prompt_coverage,
+    format_coverage_summary,
+    verify_non_deletion,
+)
+from hl_observer.release.quality_gates import format_quality_gates, run_quality_gates
 from hl_observer.security.mainnet_guard import assert_mainnet_execution_disabled
 from hl_observer.security.safety_audit import run_safety_audit
+from hl_observer.simulation.decision_replay_analyzer import (
+    analyze_decision_logs,
+    analyze_decision_logs_summary,
+    default_logs_to_send_dir,
+    format_replay_analysis,
+    load_recent_decision_events,
+)
+from hl_observer.simulation.diagnostic_reports import (
+    build_action_loss_diagnostics,
+    build_coin_loss_diagnostics,
+    build_cost_drag_diagnostics,
+    build_edge_distribution_diagnostics,
+    build_position_matching_diagnostics,
+    build_profitability_diagnostics,
+    build_refusal_breakdown,
+    build_root_cause_from_logs,
+    build_stale_signal_diagnostics,
+    build_timing_distribution_diagnostics,
+    build_wallet_loss_diagnostics,
+    format_diagnostic_report,
+)
+from hl_observer.simulation.log_metrics import analyze_logs_streaming, format_logs_analysis
+from hl_observer.simulation.loss_attribution import (
+    build_loss_attribution_report,
+    format_loss_attribution_report,
+)
+from hl_observer.simulation.readiness import (
+    build_simulation_readiness_report,
+    format_simulation_readiness,
+)
+from hl_observer.simulation.tuning_report import (
+    build_simulation_tuning_report,
+    format_simulation_tuning_report,
+)
+from hl_observer.optimization.profit_optimizer import (
+    format_optimization_report,
+    run_strategy_tournament,
+    write_optimization_reports,
+)
 from hl_observer.storage.database import init_db as initialize_database
 from hl_observer.storage.database import create_session_factory, create_sqlite_engine
 from hl_observer.storage.models import (
@@ -56,6 +194,8 @@ from hl_observer.storage.models import (
     FollowSignal,
     LeaderboardAddressValidation,
     LeaderboardWalletCandidate,
+    MarketSnapshot,
+    MarketUniverseModel,
     PaperFollowOrder,
     PositionDeltaModel,
     TopWallet,
@@ -69,6 +209,7 @@ from hl_observer.testnet.testnet_order_builder import build_testnet_order_intent
 from hl_observer.testnet.testnet_executor_locked import LockedTestnetExecutor
 from hl_observer.testnet.testnet_safety_gates import TestnetLocked
 from hl_observer.ui.app import create_ui_app
+from hl_observer.ui.persistent_state import reset_simulation_state, simulation_state_path
 from hl_observer.utils.logging import configure_logging
 from hl_observer.utils.time import now_ms
 from hl_observer.wallets.backfill import (
@@ -97,6 +238,11 @@ from hl_observer.wallets.public_trades_live import (
     scan_public_trades_ws,
     store_public_trade_scan,
 )
+from hl_observer.wallets.user_fills_live import (
+    format_user_fills_live_report,
+    scan_user_fills_ws,
+    store_user_fills_live_result,
+)
 from hl_observer.wallets.snapshot_service import record_robust_snapshot
 from hl_observer.wallets.top500_bootstrap import bootstrap_top_wallets, format_top500_report
 from hl_observer.wallets.scan_queue import format_scan_queue_report, scan_wallet_queue
@@ -109,6 +255,13 @@ from hl_observer.following.follow_decision_engine import decide_follow_signal
 from hl_observer.following.follow_signal_builder import build_follow_signal_from_opening
 from hl_observer.following.paper_follow import create_paper_follow_orders
 from hyper_smart_observer.audit.archive_audit import write_archive_audit_report
+from hyper_smart_observer.app.config import load_config as load_hypersmart_config
+from hyper_smart_observer.copy_mode.preflight import (
+    format_copy_preflight_report,
+    run_copy_preflight,
+    write_copy_preflight_report,
+)
+from hyper_smart_observer.dashboard.exporter import export_dashboard as export_hypersmart_dashboard
 from hyper_smart_observer.runtime.archive import create_clean_archive
 
 app = typer.Typer(
@@ -128,6 +281,44 @@ def _settings() -> Settings:
 def _session_factory(settings: Settings):
     initialize_database(settings.database_url)
     return create_session_factory(create_sqlite_engine(settings.database_url))
+
+
+def _store_with_sqlite_retry(
+    settings: Settings,
+    *,
+    label: str,
+    store_func,
+    attempts: int = 6,
+) -> None:
+    """Replay a complete local store transaction when SQLite is briefly busy."""
+
+    delay_seconds = 0.15
+    for attempt in range(1, attempts + 1):
+        session_factory = _session_factory(settings)
+        try:
+            with session_factory() as session:
+                store_func(session)
+                session.commit()
+            return
+        except OperationalError as exc:
+            message = str(exc).lower()
+            if "database is locked" not in message or attempt >= attempts:
+                raise
+            typer.echo(
+                f"{label}: SQLite busy, retrying safe local store {attempt}/{attempts}..."
+            )
+            time.sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 1.8, 2.0)
+
+
+def _read_json_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _record_local_snapshots(settings: Settings, wallets: list[str], *, run_id: int | None, source: str) -> None:
@@ -155,6 +346,181 @@ def _leaderboard_model_to_candidate(row: LeaderboardWalletCandidate) -> Leaderbo
         source_confidence=row.source_confidence,
         notes=row.notes,
     )
+
+
+def _unique_top_wallet_rows(rows: list[TopWallet], *, limit: int, offset: int = 0) -> list[TopWallet]:
+    """Return unique selected wallets while preserving ranking order.
+
+    Public-trades discovery can promote the same active wallet repeatedly across
+    scan cycles. The copy loop must spend its bounded /info budget on distinct
+    wallets, otherwise a "50 leaders" run may effectively scan the same few
+    wallets many times.
+    """
+
+    unique: list[TopWallet] = []
+    seen: set[str] = set()
+    for row in rows:
+        address = str(row.wallet_address or "").lower()
+        if not address or address in seen:
+            continue
+        seen.add(address)
+        unique.append(row)
+    if not unique or limit <= 0:
+        return []
+    normalized_offset = max(0, offset) % len(unique)
+    rotated = unique[normalized_offset:] + unique[:normalized_offset]
+    return rotated[: max(0, limit)]
+
+
+def _resolve_public_trade_scan_coins(settings: Settings, raw_coins: str, *, max_coins: int) -> list[str]:
+    requested = str(raw_coins or "").strip()
+    max_coins = max(1, min(int(max_coins), 200))
+    if requested.upper() not in {"AUTO", "ALL", "*"}:
+        return normalize_coin_list(requested)[:max_coins]
+
+    session_factory = _session_factory(settings)
+    with session_factory() as session:
+        db_coins = [
+            str(row.coin or "").upper()
+            for row in (
+                session.query(MarketUniverseModel)
+                .filter(MarketUniverseModel.is_active.is_(True))
+                .filter(MarketUniverseModel.is_spot.is_(False))
+                .order_by(MarketUniverseModel.coin.asc())
+                .limit(max_coins * 2)
+                .all()
+            )
+            if not str(row.coin or "").startswith(("@", "#"))
+        ]
+    default_priority = normalize_coin_list("BTC,ETH,SOL,HYPE,DOGE,XRP,BNB,ENA,AVAX,LINK")
+    merged = default_priority + [coin for coin in db_coins if coin not in default_priority]
+    return normalize_coin_list(merged)[:max_coins]
+
+
+def _selected_top_wallet_rows(
+    session,
+    *,
+    limit: int,
+    offset: int = 0,
+    active_window_ms: int = 5 * 60_000,
+) -> list[TopWallet]:
+    """Select fresh active leaders first, then fall back to the broader pool.
+
+    The live simulation should spend its 10 user-specific WebSocket slots on
+    wallets that just appeared in public trade flow. Older high-score wallets
+    remain useful as fallback, but they should not block fresh opportunities.
+    """
+
+    limit = max(1, int(limit))
+    offset = max(0, int(offset))
+    active_cutoff = now_ms() - max(30_000, active_window_ms)
+    active_rows = (
+        session.query(TopWallet)
+        .filter(TopWallet.status == "selected")
+        .filter(TopWallet.selected_at_ms >= active_cutoff)
+        .order_by(TopWallet.selected_at_ms.desc(), TopWallet.score.desc())
+        .limit(max(100, limit * 20 + offset))
+        .all()
+    )
+    selected = _unique_top_wallet_rows(active_rows, limit=limit, offset=offset)
+    if selected:
+        return selected
+    fallback_rows = (
+        session.query(TopWallet)
+        .filter(TopWallet.status == "selected")
+        .order_by(TopWallet.selected_at_ms.desc(), TopWallet.score.desc())
+        .limit(max(100, limit * 20 + offset))
+        .all()
+    )
+    return _unique_top_wallet_rows(fallback_rows, limit=limit, offset=offset)
+
+
+def _latest_market_mids(session) -> dict[str, float]:
+    row = (
+        session.query(MarketSnapshot)
+        .order_by(MarketSnapshot.id.desc())
+        .limit(1)
+        .first()
+    )
+    if row is None:
+        return {}
+    raw = row.raw_json or {}
+    if not isinstance(raw, dict):
+        return {}
+    candidates: Any = raw
+    for key in ("mids", "allMids", "data", "prices"):
+        value = raw.get(key)
+        if isinstance(value, dict):
+            candidates = value
+            break
+    mids: dict[str, float] = {}
+    if isinstance(candidates, dict):
+        for coin, value in candidates.items():
+            try:
+                price = float(value)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                mids[str(coin).upper()] = price
+    return mids
+
+
+def _consensus_top_wallet_rows(
+    session,
+    *,
+    limit: int,
+    offset: int = 0,
+    active_window_ms: int = 5 * 60_000,
+    consensus_window_ms: int = 4_000,
+    min_wallets: int = 2,
+    max_deltas: int = 5_000,
+) -> tuple[list[TopWallet], ConsensusLeaderSelectionReport]:
+    """Select follow leaders from fresh same-coin/same-direction clusters."""
+
+    current_ms = now_ms()
+    cutoff = current_ms - max(consensus_window_ms, active_window_ms)
+    top_rows = (
+        session.query(TopWallet)
+        .filter(TopWallet.status == "selected")
+        .order_by(TopWallet.score.desc(), TopWallet.selected_at_ms.desc())
+        .limit(max(200, limit * 20 + offset))
+        .all()
+    )
+    deltas = (
+        session.query(PositionDeltaModel)
+        .filter(PositionDeltaModel.detected_at_ms >= cutoff)
+        .order_by(PositionDeltaModel.detected_at_ms.desc())
+        .limit(max(100, max_deltas))
+        .all()
+    )
+    report = select_consensus_leaders_from_deltas(
+        deltas,
+        top_rows,
+        now_timestamp_ms=current_ms,
+        max_leaders=limit + offset,
+        active_window_ms=active_window_ms,
+        consensus_window_ms=consensus_window_ms,
+        min_wallets=min_wallets,
+    )
+    by_wallet = {str(row.wallet_address or "").lower(): row for row in top_rows}
+    selected_rows: list[TopWallet] = []
+    for rank, wallet in enumerate(report.selected_wallets[offset : offset + limit], start=1):
+        existing = by_wallet.get(wallet)
+        if existing is not None:
+            selected_rows.append(existing)
+            continue
+        selected_rows.append(
+            TopWallet(
+                wallet_address=wallet,
+                rank=rank,
+                source="consensus_delta_cluster",
+                score=75.0,
+                selected_at_ms=current_ms,
+                status="selected",
+                notes="selected_from_fresh_consensus_cluster;research_only",
+            )
+        )
+    return _unique_top_wallet_rows(selected_rows, limit=limit), report
 
 
 @app.command()
@@ -201,6 +567,12 @@ def safety_audit() -> None:
         raise typer.Exit(1)
 
 
+@app.command("audit-safety")
+def audit_safety() -> None:
+    """Alias for safety-audit, kept for HyperSmart prompt compatibility."""
+    safety_audit()
+
+
 @app.command("runtime-check")
 def runtime_check() -> None:
     """Report runtime files that must stay out of source archives."""
@@ -217,6 +589,38 @@ def runtime_clean_report() -> None:
     typer.echo("clean archive command: .\\CREER_ARCHIVE_PROPRE.cmd or python -m hl_observer create-clean-archive")
     typer.echo("clean archive output: Desktop\\Projet_invest_clean_YYYYMMDD_HHMMSS.zip")
     typer.echo("no runtime file is deleted, killed, copied or zipped by this report")
+
+
+@app.command("runtime-write-check")
+def runtime_write_check(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing local simulation logs."),
+    stale_after_seconds: int = typer.Option(60, "--stale-after-seconds", min=1, max=3600),
+) -> None:
+    """Check whether simulation/replay log outputs can refresh without killing processes."""
+    _settings()
+    report = check_runtime_write_readiness(from_logs, stale_after_seconds=stale_after_seconds)
+    typer.echo(format_runtime_write_readiness(report))
+
+
+@app.command("simulation-readiness")
+def simulation_readiness(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing local simulation logs."),
+    fresh_window_seconds: int = typer.Option(
+        20,
+        "--fresh-window-seconds",
+        min=1,
+        max=300,
+        help="Freshness window for leaders/deltas used by the virtual position engine.",
+    ),
+) -> None:
+    """Explain whether the local simulation can open/close virtual positions right now."""
+    settings = _settings()
+    report = build_simulation_readiness_report(
+        settings,
+        log_dir=from_logs,
+        fresh_window_ms=fresh_window_seconds * 1000,
+    )
+    typer.echo(format_simulation_readiness(report))
 
 
 @app.command("archive-audit")
@@ -236,6 +640,1005 @@ def create_clean_archive_command() -> None:
     typer.echo(f"files copied: {result.files_copied}")
     typer.echo(f"zip entries: {result.entries}")
     typer.echo(f"archive-audit report: {report_path}")
+
+
+@app.command("scanner-priority-report")
+def scanner_priority_report(
+    network_read: bool = typer.Option(False, "--network-read", help="Allow read-only scan planning to select warm-scan wallets."),
+    max_leaders: int = typer.Option(3, "--max-leaders", min=1, max=10, help="Max leaders for the next warm scan plan."),
+    output_dir: Path = typer.Option(Path("data/reports"), "--output-dir", help="Runtime report directory."),
+) -> None:
+    """Plan the next read-only scanner rotation and log skipped opportunities."""
+    settings = _settings()
+    session_factory = _session_factory(settings)
+    current_ms = now_ms()
+    with session_factory() as session:
+        rows = _selected_top_wallet_rows(session, limit=max(50, max_leaders * 10), offset=0)
+    candidates = [
+        score_wallet_priority(
+            WalletPriorityInput(
+                wallet_address=row.wallet_address,
+                source=row.source,
+                trades_count=max(1, int(row.score // 10)),
+                observed_notional_usdt=max(0.0, float(row.score) * 1000.0),
+                last_seen_ms=row.selected_at_ms,
+                now_ms=current_ms,
+                wallet_quality_score=float(row.score),
+                consistency_score=min(100.0, float(row.score)),
+                copyability_score=min(100.0, float(row.score)),
+                source_health_score=1.0,
+            )
+        )
+        for row in rows
+    ]
+    budget = ScanBudget(
+        max_leaders_per_run=max_leaders,
+        max_ws_unique_users=10,
+        rest_weight_remaining=1200,
+        network_read_enabled=network_read,
+    )
+    selection = select_wallets_for_warm_scan(candidates, budget)
+    cost = evaluate_warm_scan_budget(budget, requested_wallets=len(selection.selected_wallets))
+    typer.echo("scanner_priority_report=research_only")
+    typer.echo(f"network_read={'enabled' if network_read else 'disabled'}")
+    typer.echo(f"candidates={len(candidates)} selected={len(selection.selected_wallets)} skipped={len(selection.skipped)}")
+    typer.echo(f"budget={cost.reason} estimated_rest_weight={cost.estimated_weight} max_leaders={max_leaders}")
+    for item in selection.selected_wallets:
+        typer.echo(f"SELECT {item.wallet_address} score={item.priority_score:.2f} source={item.source}")
+    paths = write_missed_opportunity_reports(selection.skipped, output_dir=output_dir, stem="scanner_priority_missed_opportunities")
+    typer.echo(f"missed_opportunity_report={paths['markdown']}")
+
+
+@app.command("research-magic-bot")
+def research_magic_bot() -> None:
+    """Print the local research documents that separate claims from implementable logic."""
+    docs = [
+        "docs/research/MAGIC_BOT_OSINT_RESEARCH.md",
+        "docs/research/MAGIC_BOT_CLAIMS_MATRIX.md",
+        "docs/research/MAGIC_BOT_LOGIC_RECONSTRUCTION.md",
+        "docs/research/POLYMARKET_TO_HYPERLIQUID_TRANSLATION.md",
+    ]
+    typer.echo("magic_bot_research=research_only_no_profit_claim")
+    for doc in docs:
+        typer.echo(f"doc={doc} exists={Path(doc).exists()}")
+
+
+@app.command("research-data-sources")
+def research_data_sources() -> None:
+    """Show the read-only/local data provider registry."""
+    typer.echo(provider_registry_report())
+
+
+@app.command("data-quality-check")
+def data_quality_check(
+    network_read: bool = typer.Option(False, "--network-read", help="Allow budget reservation for read-only network requests."),
+    source_confidence: float = typer.Option(0.95, "--source-confidence", min=0.0, max=1.0),
+    age_ms: int = typer.Option(1_000, "--age-ms", min=0, help="Synthetic exchange data age to evaluate."),
+    latency_ms: int = typer.Option(200, "--latency-ms", min=0, help="Synthetic transport latency to evaluate."),
+    payload_items: int = typer.Option(1, "--payload-items", min=0, help="Synthetic payload size."),
+    request_weight: int = typer.Option(1, "--request-weight", min=1, help="Conservative /info weight estimate."),
+    proves_pnl: bool = typer.Option(False, "--proves-pnl", help="Require high confidence because data would support PnL/simulation decisions."),
+) -> None:
+    """Evaluate whether read-only acquired data is good enough for simulation."""
+    request = FetchRequest(
+        request_id="cli-data-quality-check",
+        provider_name="OfficialInfoProvider",
+        endpoint="/info",
+        request_type="userFillsByTime",
+        wallet_address="0x" + "1" * 40,
+        weight=request_weight,
+        network_required=True,
+        created_at_ms=now_ms(),
+    )
+    budget = RequestBudgetManager(network_read_enabled=network_read, rest_weight_remaining=1200)
+    budget_decision = budget.reserve(request)
+    current_ms = now_ms()
+    result = FetchResult(
+        request=request,
+        success=payload_items > 0,
+        payload=[{"row": index} for index in range(payload_items)],
+        fetched_at_ms=current_ms,
+        local_received_at_ms=current_ms + latency_ms,
+        exchange_ts_ms=current_ms - age_ms,
+        source_confidence_score=source_confidence,
+        transport_latency_ms=latency_ms,
+        error_message=None if payload_items > 0 else "EMPTY_PAYLOAD",
+        source_url="https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    )
+    assessment = DataQualityGate(DataQualityConfig()).assess(result, now_ms=current_ms, proves_pnl=proves_pnl)
+    typer.echo("request_budget=read_only")
+    typer.echo(f"budget_allowed={str(budget_decision.allowed).lower()}")
+    typer.echo(f"budget_reason={budget_decision.reason}")
+    typer.echo(f"remaining_after={budget_decision.remaining_after}")
+    typer.echo(format_data_quality_assessment(assessment))
+
+
+@app.command("historical-backfill-plan")
+def historical_backfill_plan(
+    network_read: bool = typer.Option(False, "--network-read", help="Reserve read-only network budget; command still uses a local fake fetcher."),
+    wallet: str = typer.Option("0x" + "1" * 40, "--wallet", help="Wallet address used for the local dry-run plan."),
+    max_pages: int = typer.Option(2, "--max-pages", min=1, max=20),
+    page_window_ms: int = typer.Option(1_000, "--page-window-ms", min=1),
+    page_items: int = typer.Option(1, "--page-items", min=0, max=2_000),
+    rest_weight_remaining: int = typer.Option(1200, "--rest-weight-remaining", min=0),
+) -> None:
+    """Run a bounded historical backfill dry-run with budget/cache/quality gates."""
+
+    async def _fake_fetch(_wallet: str, start_ms: int, _end_ms: int, _aggregate: bool) -> list[dict[str, Any]]:
+        return [
+            {
+                "user": _wallet,
+                "coin": "BTC",
+                "time": start_ms + index + 1,
+                "px": "50000",
+                "sz": "0.01",
+            }
+            for index in range(page_items)
+        ]
+
+    current_ms = now_ms()
+    engine = HistoricalBackfillEngine(
+        fetch_page=_fake_fetch,
+        budget=RequestBudgetManager(network_read_enabled=network_read, rest_weight_remaining=rest_weight_remaining),
+        cache=TtlPageCache(ttl_ms=30_000),
+        config=HistoricalBackfillConfig(max_pages_per_wallet=max_pages, page_window_ms=page_window_ms),
+    )
+    result = asyncio.run(
+        engine.run_user_fills_by_time(
+            wallet_address=wallet,
+            start_time_ms=current_ms - max_pages * page_window_ms,
+            end_time_ms=current_ms,
+            now_ms=current_ms,
+        )
+    )
+    typer.echo(format_historical_backfill_result(result))
+
+
+@app.command("benchmark-local-scan")
+def benchmark_local_scan(
+    wallets: int = typer.Option(2000, "--wallets", min=0, max=200_000, help="Fake local wallets to generate and scan."),
+) -> None:
+    """Benchmark local wallet scanning without network access."""
+    result = run_local_scan_benchmark(wallets)
+    typer.echo(format_benchmark_report(result))
+
+
+@app.command("scan-local")
+def scan_local(
+    limit: int = typer.Option(2000, "--limit", min=0, max=200_000, help="Fake local wallets to scan without network."),
+) -> None:
+    """Run a local-only scan over a generated wallet index."""
+    index = WalletLocalIndex()
+    for i in range(max(0, limit)):
+        index.upsert(fake_wallet(i + 1))
+    summary = scan_wallet_index(index, limit=limit)
+    typer.echo("scan_local=research_only_no_network")
+    typer.echo(f"wallets_scanned={summary.wallets_scanned}")
+    typer.echo(f"rejected_count={summary.rejected_count}")
+    for wallet in summary.top_wallets[:5]:
+        typer.echo(f"TOP {wallet.wallet_address} priority={wallet.priority_hint:.2f} trades={wallet.trades_count}")
+
+
+@app.command("throughput-plan")
+def throughput_plan_command(
+    requested_wallets: int = typer.Option(50, "--requested-wallets", min=0, help="Wallets the user would like to cover this cycle."),
+    network_read: bool = typer.Option(False, "--network-read", help="Required for real read-only /info planning."),
+    ws: bool = typer.Option(False, "--ws", help="Include read-only WebSocket user slots in the plan."),
+    rest_weight_remaining: int = typer.Option(1200, "--rest-weight-remaining", min=0, help="Estimated REST weight remaining this minute."),
+    max_leaders_per_run: int = typer.Option(50, "--max-leaders-per-run", min=0, help="Local maximum leaders per bounded scan run."),
+    fills_expected_per_wallet: int = typer.Option(200, "--fills-expected-per-wallet", min=0, help="Conservative fills estimate per wallet."),
+    public_trade_wallets: int = typer.Option(10_000, "--public-trade-wallets", min=0, help="Public trade wallets to retain in local candidate pool."),
+    bypass_requested: bool = typer.Option(False, "--bypass-requested", help="Test guard: refuse any attempt to bypass API limits."),
+    aggressive_scraping_requested: bool = typer.Option(False, "--aggressive-scraping-requested", help="Test guard: refuse aggressive scraping."),
+) -> None:
+    """Plan maximum safe read-only coverage without bypassing limits."""
+    _settings()
+    plan = plan_safe_high_throughput_scan(
+        ThroughputRequest(
+            requested_wallets=requested_wallets,
+            network_read_enabled=network_read,
+            ws_enabled=ws,
+            bypass_requested=bypass_requested,
+            aggressive_scraping_requested=aggressive_scraping_requested,
+            rest_weight_remaining=rest_weight_remaining,
+            max_leaders_per_run=max_leaders_per_run,
+            fills_expected_per_wallet=fills_expected_per_wallet,
+            requested_public_trade_wallets=public_trade_wallets,
+        )
+    )
+    typer.echo(format_throughput_plan(plan))
+    if bypass_requested or aggressive_scraping_requested:
+        raise typer.Exit(2)
+
+
+@app.command("fresh-scan-plan")
+def fresh_scan_plan(
+    requested_wallets: int = typer.Option(50_000, "--requested-wallets", min=0, help="Target wallet universe size before safe rotation."),
+    network_read: bool = typer.Option(False, "--network-read", help="Authorize read-only network scan planning."),
+    cycle_seconds: int = typer.Option(15, "--cycle-seconds", min=5, max=300, help="Launcher/poller cycle duration."),
+    rest_weight_remaining: int = typer.Option(1200, "--rest-weight-remaining", min=0),
+    public_trade_wallets: int = typer.Option(10_000, "--public-trade-wallets", min=0, max=100_000),
+    leaders_per_stream: int = typer.Option(10, "--leaders-per-stream", min=1, max=50),
+    bypass_requested: bool = typer.Option(False, "--bypass-requested", help="Test guard: refuse API/rate-limit bypass."),
+    aggressive_scraping_requested: bool = typer.Option(False, "--aggressive-scraping-requested", help="Test guard: refuse aggressive scraping."),
+) -> None:
+    """Plan a high-freshness scan loop without bypassing Hyperliquid limits."""
+    settings = _settings()
+    current_ms = now_ms()
+    analysis = analyze_decision_logs_summary(default_logs_to_send_dir())
+    stale_count = sum(count for reason, count in analysis.top_refusal_reasons if "STALE_SIGNAL" in reason)
+    session_factory = _session_factory(settings)
+    with session_factory() as session:
+        fresh_leaders = int(
+            session.query(TopWallet)
+            .filter(TopWallet.status == "selected")
+            .filter(TopWallet.selected_at_ms >= current_ms - 60_000)
+            .count()
+        )
+        fresh_deltas = int(
+            session.query(PositionDeltaModel)
+            .filter(PositionDeltaModel.detected_at_ms >= current_ms - 20_000)
+            .count()
+        )
+    plan = plan_fresh_scan_strategy(
+        FreshScanStrategyRequest(
+            requested_wallet_universe=requested_wallets,
+            network_read_enabled=network_read,
+            cycle_seconds=cycle_seconds,
+            rest_weight_remaining=rest_weight_remaining,
+            leaders_per_user_stream=leaders_per_stream,
+            public_trade_wallet_cap_requested=public_trade_wallets,
+            stale_signal_count=stale_count,
+            fresh_leader_count=fresh_leaders,
+            fresh_delta_count=fresh_deltas,
+            bypass_requested=bypass_requested,
+            aggressive_scraping_requested=aggressive_scraping_requested,
+        )
+    )
+    typer.echo(format_fresh_scan_strategy(plan))
+    if bypass_requested or aggressive_scraping_requested:
+        raise typer.Exit(2)
+
+
+@app.command("fresh-data-plan")
+def fresh_data_plan_command(
+    network_read: bool = typer.Option(False, "--network-read", help="Authorize read-only public/official data reads."),
+    requested_wallets: int = typer.Option(50_000, "--requested-wallets", min=0, help="Target local wallet universe size."),
+    coins: str = typer.Option("AUTO", "--coins", help="Coins to monitor, comma separated or AUTO."),
+    max_coins: int = typer.Option(40, "--max-coins", min=1, max=200),
+    max_hot_wallets: int = typer.Option(10, "--max-hot-wallets", min=1, max=50),
+    rest_weight_remaining: int = typer.Option(1200, "--rest-weight-remaining", min=0),
+    max_items: int = typer.Option(128, "--max-items", min=1, max=1000),
+    gap_recovery: bool = typer.Option(False, "--gap-recovery", help="Include bounded REST recovery snapshots for hot leaders."),
+) -> None:
+    """Plan the freshest safe read-only acquisition batch for the next cycle."""
+    settings = _settings()
+    current_ms = now_ms()
+    active_coins = tuple(_resolve_public_trade_scan_coins(settings, coins, max_coins=max_coins))
+    analysis = analyze_decision_logs_summary(default_logs_to_send_dir())
+    stale_count = sum(count for reason, count in analysis.top_refusal_reasons if "STALE_SIGNAL" in reason)
+    stale_pressure = "CRITICAL" if stale_count >= 1000 else "HIGH" if stale_count else "LOW"
+    session_factory = _session_factory(settings)
+    with session_factory() as session:
+        hot_wallets = tuple(row.wallet_address for row in _selected_top_wallet_rows(session, limit=min(10, max_hot_wallets)))
+    plan = build_fresh_data_plan(
+        FreshDataPlanRequest(
+            network_read_enabled=network_read,
+            active_coins=active_coins,
+            hot_wallets=hot_wallets,
+            requested_wallet_universe=requested_wallets,
+            rest_weight_remaining=rest_weight_remaining,
+            max_hot_wallets=max_hot_wallets,
+            max_items=max_items,
+            now_ms=current_ms,
+            gap_recovery=gap_recovery or stale_pressure in {"HIGH", "CRITICAL"},
+            stale_pressure=stale_pressure,
+        )
+    )
+    typer.echo(format_fresh_data_plan(plan))
+
+
+@app.command("consensus-leader-report")
+def consensus_leader_report_command(
+    leaders: int = typer.Option(10, "--leaders", min=1, max=50),
+    active_window_seconds: int = typer.Option(300, "--active-window-seconds", min=4),
+    consensus_window_seconds: int = typer.Option(4, "--consensus-window-seconds", min=1, max=60),
+    min_wallets: int = typer.Option(2, "--min-wallets", min=2, max=10),
+    max_deltas: int = typer.Option(5_000, "--max-deltas", min=100),
+) -> None:
+    """Rank leaders by fresh same-coin/same-direction consensus clusters."""
+    settings = _settings()
+    session_factory = _session_factory(settings)
+    with session_factory() as session:
+        _, report = _consensus_top_wallet_rows(
+            session,
+            limit=leaders,
+            active_window_ms=active_window_seconds * 1_000,
+            consensus_window_ms=consensus_window_seconds * 1_000,
+            min_wallets=min_wallets,
+            max_deltas=max_deltas,
+        )
+    typer.echo(format_consensus_leader_report(report))
+
+
+@app.command("hot-watch")
+def hot_watch(
+    network_read: bool = typer.Option(False, "--network-read", help="Required for real read-only websocket watching; this command plans only."),
+    duration_seconds: int = typer.Option(60, "--duration-seconds", min=1, max=3600, help="Bounded hot-watch duration."),
+    dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="Keep as dry-run planning."),
+) -> None:
+    """Plan a bounded read-only hot-watch rotation; never opens orders."""
+    if not dry_run:
+        typer.echo("Safety refused: hot-watch remains dry-run/read-only in this build.")
+        raise typer.Exit(2)
+    settings = _settings()
+    session_factory = _session_factory(settings)
+    current_ms = now_ms()
+    with session_factory() as session:
+        rows = _selected_top_wallet_rows(session, limit=50)
+    candidates = [(row.wallet_address, float(row.score), row.selected_at_ms) for row in rows]
+    slots = rotate_hot_watch(candidates, now_ms=current_ms, max_slots=10, slot_ttl_ms=duration_seconds * 1000)
+    typer.echo("hot_watch_plan=read_only_dry_run")
+    typer.echo(f"network_read={'enabled' if network_read else 'disabled'}")
+    typer.echo(f"duration_seconds={duration_seconds}")
+    typer.echo(f"slots={len(slots)} max_unique_users=10")
+    for slot in slots:
+        typer.echo(f"SLOT {slot.slot_id} {slot.wallet_address} priority={slot.priority:.2f} expires_at_ms={slot.expires_at_ms}")
+
+
+@app.command("realtime-recovery-plan")
+def realtime_recovery_plan(
+    wallet: str = typer.Option("0x" + "1" * 40, "--wallet"),
+    stale_after_ms: int = typer.Option(20_000, "--stale-after-ms", min=1),
+    event_gap_ms: int = typer.Option(5_000, "--event-gap-ms", min=1),
+    sequence_gap: int = typer.Option(3, "--sequence-gap", min=1),
+) -> None:
+    """Plan reconnect/backfill after a stale or gapped read-only realtime stream."""
+    current_ms = now_ms()
+    engine = RealtimeRecoveryEngine(
+        ReconnectPolicy(
+            stale_after_ms=stale_after_ms,
+            max_event_gap_ms=event_gap_ms,
+            max_sequence_gap=1,
+            max_pages=3,
+        )
+    )
+    first = WatchStreamEvent(
+        event_id="cli:first",
+        wallet_address=wallet,
+        observed_at_ms=current_ms - 10_000,
+        received_at_ms=current_ms - 10_000,
+        event_type=StreamEventType.NEW,
+        sequence=1,
+        payload_hash="first",
+    )
+    second = WatchStreamEvent(
+        event_id="cli:gapped",
+        wallet_address=wallet,
+        observed_at_ms=current_ms,
+        received_at_ms=current_ms + stale_after_ms + 1,
+        event_type=StreamEventType.NEW,
+        sequence=1 + sequence_gap,
+        payload_hash="gapped",
+    )
+    engine.process_event(first)
+    decision = engine.process_event(second)
+    typer.echo(format_recovery_decision(decision))
+
+
+@app.command("missed-opportunities")
+def missed_opportunities(
+    period: str = typer.Option("24h", "--period", help="Display label only; report is local runtime."),
+) -> None:
+    """Show the latest local missed-opportunity report path and summary."""
+    path = Path("data/reports/scanner_priority_missed_opportunities.md")
+    typer.echo("missed_opportunities=research_only")
+    typer.echo(f"period={period}")
+    typer.echo(f"report={path}")
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+        first_total = next((line for line in text.splitlines() if line.startswith("Total:")), "Total: unknown")
+        typer.echo(first_total)
+    else:
+        typer.echo("Total: 0")
+
+
+@app.command("opportunity-report")
+def opportunity_report(
+    period: str = typer.Option("1h", "--period", help="Display period label."),
+    active_window_seconds: int = typer.Option(120, "--active-window-seconds", min=1, max=3600, help="Only analyze fresh deltas inside this window."),
+    consensus_window_seconds: int = typer.Option(4, "--consensus-window-seconds", min=1, max=60, help="Same coin/same direction grouping window."),
+    min_wallets: int = typer.Option(2, "--min-wallets", min=1, max=10, help="Minimum wallets needed for a cluster."),
+    max_deltas: int = typer.Option(5_000, "--max-deltas", min=10, max=100_000),
+    max_opportunities: int = typer.Option(20, "--max-opportunities", min=1, max=100),
+) -> None:
+    """Rank fresh same-coin/same-direction clusters for virtual simulation only."""
+    settings = _settings()
+    session_factory = _session_factory(settings)
+    current_ms = now_ms()
+    with session_factory() as session:
+        leaders = (
+            session.query(TopWallet)
+            .filter(TopWallet.status == "selected")
+            .order_by(TopWallet.selected_at_ms.desc(), TopWallet.score.desc())
+            .limit(5_000)
+            .all()
+        )
+        deltas = (
+            session.query(PositionDeltaModel)
+            .order_by(PositionDeltaModel.detected_at_ms.desc())
+            .limit(max_deltas)
+            .all()
+        )
+        mids = _latest_market_mids(session)
+    simulation_min_edge_bps = float(os.environ.get("HYPERSMART_SIMULATION_MIN_EDGE_BPS", settings.risk.min_edge_required_bps))
+    report = find_fresh_opportunities(
+        deltas,
+        leaders,
+        now_timestamp_ms=current_ms,
+        current_mids=mids,
+        active_window_ms=active_window_seconds * 1_000,
+        consensus_window_ms=consensus_window_seconds * 1_000,
+        min_wallets=min_wallets,
+        max_opportunities=max_opportunities,
+        risk_config=RealtimeCopyRiskConfig(
+            min_edge_required_bps=max(1.0, simulation_min_edge_bps),
+            max_signal_age_ms=active_window_seconds * 1_000,
+            starting_equity_usdt=1000.0,
+        ),
+    )
+    typer.echo(format_fresh_opportunity_report(report))
+    typer.echo(f"period={period}")
+
+
+@app.command("warehouse-report")
+def warehouse_report(
+    fresh_window_seconds: int = typer.Option(20, "--fresh-window-seconds", min=1, max=3600),
+) -> None:
+    """Explain which local data layers are fresh enough for paper simulation."""
+    settings = _settings()
+    session_factory = _session_factory(settings)
+    current_ms = now_ms()
+    with session_factory() as session:
+        report = build_warehouse_coverage_report(
+            session,
+            now_ms=current_ms,
+            fresh_window_ms=fresh_window_seconds * 1_000,
+        )
+    typer.echo(format_warehouse_coverage_report(report))
+
+
+@app.command("consensus-report")
+def consensus_report(
+    period: str = typer.Option("1h", "--period", help="Display period label."),
+) -> None:
+    """Report consensus policy used by local simulation."""
+    typer.echo("consensus_report=research_only")
+    typer.echo(f"period={period}")
+    typer.echo("policy=same coin + same direction + short fresh window")
+    typer.echo("safety=consensus alone never bypasses edge_remaining_bps")
+
+
+@app.command("simulate-magic-bot")
+def simulate_magic_bot(
+    capital: float = typer.Option(1000.0, "--capital", min=1.0, help="Virtual local starting capital."),
+    scenario: str = typer.Option("conservative", "--scenario", help="Simulation scenario label."),
+) -> None:
+    """Start/report a local simulation plan; no order, no network."""
+    if abs(capital - 1000.0) > 0.001:
+        typer.echo("Safety warning: product default is 1000 USDT fictive; custom capital is report-only.")
+    typer.echo("simulate_magic_bot=local_simulation_without_money")
+    typer.echo(f"capital={capital:.2f}")
+    typer.echo(f"scenario={scenario}")
+    typer.echo("max_position_notional=50.00")
+    typer.echo("max_total_exposure=200.00")
+    typer.echo("execution=forbidden")
+
+
+@app.command("simulation-report")
+def simulation_report(
+    period: str = typer.Option("24h", "--period", help="Display period label."),
+) -> None:
+    """Show where the live local simulation state is stored."""
+    settings = _settings()
+    typer.echo("simulation_report=local_without_money")
+    typer.echo(f"period={period}")
+    typer.echo(f"state_path={simulation_state_path(settings)}")
+    typer.echo("starting_equity_usdt=1000.00")
+
+
+@app.command("simulation-loss-report")
+def simulation_loss_report(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Explain why the local simulation gains, loses or refuses decisions."""
+    _settings()
+    report = build_loss_attribution_report(from_logs)
+    typer.echo(format_loss_attribution_report(report))
+
+
+@app.command("simulation-tuning-report")
+def simulation_tuning_report(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Recommend stricter local simulation tuning from observed losses/refusals."""
+    _settings()
+    typer.echo(format_simulation_tuning_report(build_simulation_tuning_report(from_logs)))
+
+
+@app.command("logs-analyze")
+def logs_analyze(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Stream all simulation decision logs and report PnL/root metrics."""
+    _settings()
+    typer.echo(format_logs_analysis(analyze_logs_streaming(from_logs)))
+
+
+@app.command("root-cause-from-logs")
+def root_cause_from_logs(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Explain the dominant local simulation loss causes from logs."""
+    _settings()
+    typer.echo(format_diagnostic_report(build_root_cause_from_logs(from_logs)))
+
+
+@app.command("profitability-diagnostics")
+def profitability_diagnostics(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Report gross/net PnL after costs from simulation logs."""
+    _settings()
+    typer.echo(format_diagnostic_report(build_profitability_diagnostics(from_logs)))
+
+
+@app.command("refusal-breakdown")
+def refusal_breakdown(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Rank no-trade/refusal reasons from simulation logs."""
+    _settings()
+    typer.echo(format_diagnostic_report(build_refusal_breakdown(from_logs)))
+
+
+@app.command("cost-drag-diagnostics")
+def cost_drag_diagnostics(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Diagnose fees and cost drag in local simulation logs."""
+    _settings()
+    typer.echo(format_diagnostic_report(build_cost_drag_diagnostics(from_logs)))
+
+
+@app.command("position-matching-diagnostics")
+def position_matching_diagnostics(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Diagnose orphan reduce/close and ADD-without-OPEN issues."""
+    _settings()
+    typer.echo(format_diagnostic_report(build_position_matching_diagnostics(from_logs)))
+
+
+@app.command("stale-signal-diagnostics")
+def stale_signal_diagnostics(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Diagnose signal-age and stale-copy problems."""
+    _settings()
+    typer.echo(format_diagnostic_report(build_stale_signal_diagnostics(from_logs)))
+
+
+@app.command("wallet-loss-diagnostics")
+def wallet_loss_diagnostics(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Rank wallets by net PnL contribution in local simulation logs."""
+    _settings()
+    typer.echo(format_diagnostic_report(build_wallet_loss_diagnostics(from_logs)))
+
+
+@app.command("coin-loss-diagnostics")
+def coin_loss_diagnostics(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Rank coins by net PnL contribution in local simulation logs."""
+    _settings()
+    typer.echo(format_diagnostic_report(build_coin_loss_diagnostics(from_logs)))
+
+
+@app.command("action-loss-diagnostics")
+def action_loss_diagnostics(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Rank OPEN/ADD/REDUCE/CLOSE actions by net PnL contribution."""
+    _settings()
+    typer.echo(format_diagnostic_report(build_action_loss_diagnostics(from_logs)))
+
+
+@app.command("edge-distribution-diagnostics")
+def edge_distribution_diagnostics(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Report edge_remaining_bps distribution and sentinels."""
+    _settings()
+    typer.echo(format_diagnostic_report(build_edge_distribution_diagnostics(from_logs)))
+
+
+@app.command("timing-distribution-diagnostics")
+def timing_distribution_diagnostics(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Report timing/freshness distribution for copy signals."""
+    _settings()
+    typer.echo(format_diagnostic_report(build_timing_distribution_diagnostics(from_logs)))
+
+
+def _try_write_optimization_reports(report, output_dir: Path) -> None:
+    try:
+        write_optimization_reports(report, output_dir)
+    except OSError as exc:
+        typer.echo(
+            f"optimization_report_write=unavailable path={output_dir} reason={exc.__class__.__name__}: {exc}",
+            err=True,
+        )
+        typer.echo("optimization_report_write_policy=analysis_printed_without_runtime_file_mutation", err=True)
+
+
+@app.command("strategy-tournament")
+def strategy_tournament(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+    output_dir: Path = typer.Option(Path("data/reports"), "--output-dir", help="Runtime report output directory."),
+) -> None:
+    """Compare strategy families on train/validation/holdout without fake gains."""
+    _settings()
+    report = run_strategy_tournament(from_logs)
+    _try_write_optimization_reports(report, output_dir)
+    typer.echo(format_optimization_report(report))
+
+
+@app.command("optimize-profit-config")
+def optimize_profit_config(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+    output_dir: Path = typer.Option(Path("data/reports"), "--output-dir", help="Runtime report output directory."),
+) -> None:
+    """Select the most robust net-PnL configuration from simulation logs."""
+    _settings()
+    report = run_strategy_tournament(from_logs)
+    _try_write_optimization_reports(report, output_dir)
+    typer.echo(format_optimization_report(report))
+
+
+@app.command("walk-forward-profit-validation")
+def walk_forward_profit_validation(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+    output_dir: Path = typer.Option(Path("data/reports"), "--output-dir", help="Runtime report output directory."),
+) -> None:
+    """Validate best config on train/validation/holdout windows."""
+    _settings()
+    report = run_strategy_tournament(from_logs)
+    _try_write_optimization_reports(report, output_dir)
+    typer.echo(format_optimization_report(report))
+
+
+@app.command("out-of-sample-report")
+def out_of_sample_report(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+    output_dir: Path = typer.Option(Path("data/reports"), "--output-dir", help="Runtime report output directory."),
+) -> None:
+    """Report holdout behavior for strategy candidates."""
+    _settings()
+    report = run_strategy_tournament(from_logs)
+    _try_write_optimization_reports(report, output_dir)
+    typer.echo(format_optimization_report(report))
+
+
+@app.command("anti-overfit-audit")
+def anti_overfit_audit(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+    output_dir: Path = typer.Option(Path("data/reports"), "--output-dir", help="Runtime report output directory."),
+) -> None:
+    """Audit whether candidate configs only win on train and fail holdout."""
+    _settings()
+    report = run_strategy_tournament(from_logs)
+    _try_write_optimization_reports(report, output_dir)
+    typer.echo("anti_overfit_audit=simulation_only")
+    for result in report.strategies:
+        typer.echo(f"{result.config.name}: overfit_rejected={str(result.overfit_rejected).lower()}")
+    typer.echo("future_profit_guarantee=false")
+
+
+@app.command("best-config-report")
+def best_config_report(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+    output_dir: Path = typer.Option(Path("data/reports"), "--output-dir", help="Runtime report output directory."),
+) -> None:
+    """Print the current best robust config from local logs."""
+    _settings()
+    report = run_strategy_tournament(from_logs)
+    _try_write_optimization_reports(report, output_dir)
+    typer.echo(format_optimization_report(report))
+
+
+@app.command("explain-loss-fr")
+def explain_loss_fr(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing logs to send."),
+) -> None:
+    """Explain simulation losses in beginner-friendly French."""
+    _settings()
+    report = build_loss_attribution_report(from_logs)
+    typer.echo("explain_loss_fr=simulation_only")
+    for item in report.root_causes.plain_french:
+        typer.echo(f"- {item}")
+
+
+@app.command("realtime-health")
+def realtime_health(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing local replay logs."),
+    stale_after_seconds: int = typer.Option(30, "--stale-after-seconds", min=1, max=3600),
+) -> None:
+    """Check whether the local realtime simulation feed is fresh enough."""
+    _settings()
+    typer.echo(format_realtime_health(check_realtime_health(from_logs, stale_after_seconds=stale_after_seconds)))
+
+
+@app.command("realtime-replay")
+def realtime_replay(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing local replay logs."),
+    speed: str = typer.Option("5x", "--speed", help="Display/replay speed label; no sleeping or network."),
+    limit: int = typer.Option(100, "--limit", min=1, max=10_000, help="Max recent events to export into replay."),
+) -> None:
+    """Create a fresh read-only replay stream from local logs."""
+    _settings()
+    typer.echo(format_replay_result(replay_events_from_logs(from_logs, speed=speed, limit=limit)))
+
+
+@app.command("realtime-latency-report")
+def realtime_latency_report(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing local replay logs."),
+) -> None:
+    """Measure local signal-age latency from simulation logs."""
+    _settings()
+    typer.echo(format_latency_report(build_latency_report(from_logs)))
+
+
+@app.command("freshness-diagnostics")
+def freshness_diagnostics(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing local replay logs."),
+) -> None:
+    """Diagnose stale signals and recommend safer scanner settings."""
+    _settings()
+    typer.echo(format_freshness_diagnostics(build_freshness_diagnostics(from_logs)))
+
+
+@app.command("live-pnl")
+def live_pnl(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing local replay logs."),
+) -> None:
+    """Print current local simulated PnL from logs; no network and no orders."""
+    _settings()
+    snapshot = _read_json_file(from_logs / "simulation_snapshot_latest.json")
+    equity = snapshot.get("equity") if isinstance(snapshot.get("equity"), dict) else {}
+    analysis = analyze_decision_logs_summary(from_logs)
+    typer.echo("live_pnl=local_simulation_only")
+    typer.echo(f"source_dir={from_logs}")
+    typer.echo(f"starting_equity_usdt={equity.get('starting_equity_usdt', snapshot.get('starting_equity_usdt'))}")
+    typer.echo(f"current_equity_usdt={equity.get('current_equity_usdt')}")
+    typer.echo(f"current_pnl_usdc={equity.get('current_pnl_usdc')}")
+    typer.echo(f"realized_pnl_usdc={equity.get('realized_pnl_usdc')}")
+    typer.echo(f"unrealized_pnl_usdc={equity.get('unrealized_pnl_usdc')}")
+    typer.echo(f"events={analysis.event_count}")
+    typer.echo(f"closed_log_event_pnl_usdc={analysis.total_estimated_pnl_usdc}")
+    typer.echo(f"closed_log_fees_usdc={analysis.total_fees_usdc}")
+    typer.echo("pnl_scope=session_balance_is_fresh_launcher_state; closed_log_event_pnl_is_complete_local_decision_log")
+    typer.echo("orders_created=0")
+
+
+@app.command("pnl-stream")
+def pnl_stream(
+    replay: Path = typer.Option(default_logs_to_send_dir(), "--replay", help="Folder containing local replay logs."),
+    limit: int = typer.Option(20, "--limit", min=1, max=500),
+) -> None:
+    """Replay recent PnL events from local logs; this is not a network stream."""
+    _settings()
+    events = load_recent_decision_events(replay, limit=limit)
+    typer.echo("pnl_stream=local_replay_only")
+    typer.echo(f"source_dir={replay}")
+    for event in events:
+        typer.echo(
+            " | ".join(
+                [
+                    str(event.timestamp_ms),
+                    str(event.coin),
+                    event.bot_decision,
+                    f"pnl={event.estimated_net_pnl_usdc}",
+                    f"fee={event.fee_cost_usdc}",
+                    f"reason={event.reason}",
+                ]
+            )
+        )
+
+
+@app.command("metagraph-export")
+def metagraph_export(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing local replay logs."),
+    output_dir: Path = typer.Option(Path("data/reports"), "--output-dir", help="Runtime report output directory."),
+) -> None:
+    """Export PnL/equity metagraph data from local simulation logs."""
+    _settings()
+    typer.echo(format_metagraph_export(export_metagraph_from_logs(from_logs, output_dir=output_dir)))
+
+
+@app.command("dashboard-export")
+def dashboard_export() -> None:
+    """Export the read-only HyperSmart dashboard HTML; no network and no actions."""
+    _settings()
+    config = load_hypersmart_config()
+    path = export_hypersmart_dashboard(config)
+    typer.echo("dashboard_export=read_only")
+    typer.echo(f"path={path}")
+    typer.echo("orders_created=0")
+    typer.echo("network_required=false")
+
+
+@app.command("dashboard-state")
+def dashboard_state(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing dashboard logs."),
+) -> None:
+    """Report dashboard state provenance and current simulation snapshot."""
+    settings = _settings()
+    truth = run_dashboard_truth_audit(from_logs)
+    health = check_realtime_health(from_logs)
+    typer.echo("dashboard_state=local_read_only")
+    typer.echo(f"state_path={simulation_state_path(settings)}")
+    typer.echo(f"logs_dir={from_logs}")
+    typer.echo(f"truth_ok={str(truth.ok).lower()}")
+    typer.echo(f"realtime_status={health.status}")
+    typer.echo(f"events_seen={health.events_seen}")
+
+
+@app.command("copy-preflight")
+def copy_preflight(
+    network_read: bool = typer.Option(False, "--network-read", help="Plan bounded /info reads; no orders."),
+    copy_max_leaders: int | None = typer.Option(None, "--copy-max-leaders", min=1),
+) -> None:
+    """Check whether copy-run can perform a bounded read-only collection."""
+    _settings()
+    config = load_hypersmart_config()
+    report = run_copy_preflight(config, network_read=network_read, max_leaders=copy_max_leaders)
+    json_path, md_path = write_copy_preflight_report(report, config.reports_dir)
+    typer.echo(format_copy_preflight_report(report))
+    typer.echo(f"copy_preflight_json={json_path}")
+    typer.echo(f"copy_preflight_md={md_path}")
+    typer.echo("orders_created=0")
+    typer.echo("testnet_executor_active=false")
+
+
+@app.command("dashboard-truth-audit")
+def dashboard_truth_audit(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing dashboard logs."),
+) -> None:
+    """Audit that dashboard metrics have local provenance and are not placeholders."""
+    _settings()
+    audit = run_dashboard_truth_audit(from_logs)
+    typer.echo(format_dashboard_truth_audit(audit))
+    if not audit.ok:
+        raise typer.Exit(1)
+
+
+@app.command("prompt-coverage-audit")
+def prompt_coverage_audit() -> None:
+    """Write MEGA V1 prompt coverage and traceability reports."""
+    _settings()
+    audit = evaluate_prompt_coverage(Path("."))
+    typer.echo(format_coverage_summary(audit))
+
+
+@app.command("non-deletion-check")
+def non_deletion_check() -> None:
+    """Verify every major MEGA V1 requirement family is still tracked."""
+    _settings()
+    audit = evaluate_prompt_coverage(Path("."))
+    ok, missing = verify_non_deletion(audit.rows)
+    typer.echo("non_deletion_check=tracked")
+    typer.echo(f"families={audit.total}")
+    typer.echo(f"todo_or_partial={len(missing)}")
+    typer.echo(f"report={audit.non_deletion_path}")
+    if not ok:
+        typer.echo("missing=" + ",".join(missing))
+        raise typer.Exit(1)
+
+
+@app.command("quality-gates")
+def quality_gates(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing dashboard logs."),
+) -> None:
+    """Run release quality gates without executing trades."""
+    _settings()
+    report = run_quality_gates(Path("."), log_dir=from_logs)
+    typer.echo(format_quality_gates(report))
+    if report.hard_failed:
+        raise typer.Exit(1)
+
+
+@app.command("closeout-sprint")
+def closeout_sprint(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing dashboard logs."),
+) -> None:
+    """Write a closeout report with quality gates and safe next actions."""
+    _settings()
+    report = write_closeout_report(Path("."), log_dir=from_logs)
+    typer.echo(f"closeout_report={report.report_path}")
+    typer.echo(format_quality_gates(report.quality))
+    if report.quality.hard_failed:
+        raise typer.Exit(1)
+
+
+@app.command("explain-latest-decision-fr")
+def explain_latest_decision_fr(
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing local replay logs."),
+) -> None:
+    """Explain the latest local simulation decision in simple French."""
+    _settings()
+    events = load_recent_decision_events(from_logs, limit=1)
+    typer.echo("explain_latest_decision_fr=simulation_only")
+    if not events:
+        typer.echo("- Aucune decision locale enregistree.")
+        return
+    event = events[-1]
+    typer.echo(f"- Ce que le bot a vu: {event.leader_action or 'action inconnue'} sur {event.coin or 'coin inconnu'} par {event.wallet_address or 'wallet inconnu'}.")
+    typer.echo(f"- Decision locale: {event.bot_decision}, statut {event.status}.")
+    typer.echo(f"- Raison: {event.reason or 'aucune raison detaillee'}")
+    typer.echo(f"- Impact PnL fictif: {event.estimated_net_pnl_usdc}")
+    typer.echo("- Securite: simulation locale seulement, aucun ordre reel.")
+
+
+@app.command("explain-no-trade-fr")
+def explain_no_trade_fr(
+    latest: bool = typer.Option(False, "--latest", help="Explain latest no-trade only."),
+    from_logs: Path = typer.Option(default_logs_to_send_dir(), "--from-logs", help="Folder containing local replay logs."),
+) -> None:
+    """Explain no-trade decisions in French."""
+    _settings()
+    events = load_recent_decision_events(from_logs, limit=500 if latest else 2_000)
+    refused = [event for event in events if event.status.upper() == "REFUSED" or event.bot_decision == "NO_TRADE"]
+    typer.echo("explain_no_trade_fr=simulation_only")
+    if not refused:
+        typer.echo("- Aucun refus local enregistre.")
+        return
+    rows = refused[-1:] if latest else refused[-10:]
+    for event in rows:
+        typer.echo(f"- {event.coin or 'coin inconnu'}: refus `{event.reason or 'raison inconnue'}`. Action suivante: verifier edge_remaining, fraicheur du signal et position papier correspondante.")
+
+
+@app.command("research-import-manual")
+def research_import_manual(
+    path: Path = typer.Option(Path("docs/research/MEGA_V1_MANUAL_RESEARCH_INBOX.md"), "--path", help="Manual research inbox path."),
+    output: Path = typer.Option(Path("data/reports/manual_research_items.json"), "--output", help="Runtime JSON output."),
+) -> None:
+    """Import manual research notes into a structured local JSON file."""
+    _settings()
+    if not path.exists():
+        write_manual_research_template(path)
+    typer.echo(format_manual_research_import(import_manual_research(path, output_path=output)))
+
+
+@app.command("research-classify-manual")
+def research_classify_manual(
+    path: Path = typer.Option(Path("docs/research/MEGA_V1_MANUAL_RESEARCH_INBOX.md"), "--path", help="Manual research inbox path."),
+) -> None:
+    """Classify manual research; never treats user-provided claims as truth."""
+    _settings()
+    typer.echo(format_classified_research(classify_manual_research(path)))
+
+
+@app.command("research-to-feature-map")
+def research_to_feature_map(
+    path: Path = typer.Option(Path("docs/research/MEGA_V1_MANUAL_RESEARCH_INBOX.md"), "--path", help="Manual research inbox path."),
+) -> None:
+    """Write a source-to-feature map for manual research."""
+    _settings()
+    typer.echo(format_feature_map(write_research_to_feature_map(path)))
 
 
 @app.command("autoscan")
@@ -1106,10 +2509,12 @@ def copy_run_command(
     source_mode: str = typer.Option("polling", "--source-mode", help="polling or ws-dry-run."),
     leaders: int = typer.Option(50, "--leaders", "--copy-max-leaders", help="Maximum leaders to auto-select."),
     leader_offset: int = typer.Option(0, "--leader-offset", help="Skip this many ranked leaders before selecting the current bounded batch."),
-    max_deltas: int = typer.Option(100, "--max-deltas", help="Recent position deltas to inspect."),
+    max_deltas: int = typer.Option(500, "--max-deltas", help="Recent position deltas to inspect."),
     network_read: bool = typer.Option(False, "--network-read", help="Explicitly allow bounded read-only /info collection before detection."),
     backfill_days: int = typer.Option(1, "--backfill-days", help="Bounded recent history window for --network-read."),
     fresh_window_minutes: int = typer.Option(15, "--fresh-window-minutes", help="Fresh read window for live simulation; set 0 to use --backfill-days."),
+    consensus_window_seconds: int = typer.Option(4, "--consensus-window-seconds", min=1, max=300, help="Same coin/side leader clustering window for wallet selection."),
+    consensus_min_wallets: int = typer.Option(3, "--consensus-min-wallets", min=2, max=10, help="Minimum independent wallets for consensus-prioritized selection."),
     max_pages: int = typer.Option(2, "--max-pages", help="Maximum userFillsByTime pages per wallet for --network-read."),
     dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="Batch 1 is dry-run only."),
     report: bool = typer.Option(True, "--report/--no-report", help="Print copy-run report."),
@@ -1120,7 +2525,10 @@ def copy_run_command(
         typer.echo("copy-run refused: Batch 1 is dry-run only; no orders and no testnet execution.")
         raise typer.Exit(1)
     session_factory = _session_factory(settings)
+    consensus_selection_report: ConsensusLeaderSelectionReport | None = None
     with session_factory() as session:
+        leaders = max(1, min(leaders, settings.copy_trading.top_leaders))
+        leader_offset = max(0, leader_offset)
         leaderboard_rows = (
             session.query(LeaderboardWalletCandidate)
             .order_by(LeaderboardWalletCandidate.leaderboard_score.desc())
@@ -1159,49 +2567,94 @@ def copy_run_command(
             )
             for item in accepted_batch
         ]
-        if not followed:
-            followed = (
-                session.query(TopWallet)
-                .filter(TopWallet.status == "selected")
-                .order_by(TopWallet.score.desc())
-                .offset(leader_offset)
-                .limit(leaders)
-                .all()
-            )
-        followed = followed[:leaders]
+        followed = _unique_top_wallet_rows(followed, limit=leaders)
+        consensus_followed, consensus_selection_report = _consensus_top_wallet_rows(
+            session,
+            limit=leaders,
+            offset=leader_offset,
+            active_window_ms=max(60_000, fresh_window_minutes * 60_000 if fresh_window_minutes > 0 else 5 * 60_000),
+            consensus_window_ms=consensus_window_seconds * 1_000,
+            min_wallets=consensus_min_wallets,
+            max_deltas=max(1_000, max_deltas * 10),
+        )
+        if consensus_followed:
+            followed = consensus_followed
+        elif not followed:
+            followed = _selected_top_wallet_rows(session, limit=leaders, offset=leader_offset)
+        followed = _unique_top_wallet_rows(followed, limit=leaders)
         followed_addresses = {wallet.wallet_address.lower() for wallet in followed}
+
+    pre_backfill_signals = None
+    throughput_plan = None
+    if network_read:
+        throughput_plan = plan_safe_high_throughput_scan(
+            ThroughputRequest(
+                requested_wallets=len(followed),
+                network_read_enabled=True,
+                ws_enabled=source_mode.lower() in {"ws", "websocket", "ws-dry-run"},
+                rest_weight_remaining=1200,
+                max_leaders_per_run=leaders,
+                fills_expected_per_wallet=max(200, min(2_000, max_pages * 500)),
+                ws_requested_unique_users=min(10, leaders),
+            )
+        )
+        if throughput_plan.selected_wallets < len(followed):
+            followed = followed[: throughput_plan.selected_wallets]
+            followed_addresses = {wallet.wallet_address.lower() for wallet in followed}
+    if network_read and followed:
+        with session_factory() as session:
+            delta_query = session.query(PositionDeltaModel).order_by(PositionDeltaModel.detected_at_ms.desc())
+            delta_query = delta_query.filter(PositionDeltaModel.wallet_address.in_(followed_addresses))
+            pre_deltas = delta_query.limit(max_deltas).all()
+        mode = CopySourceMode.WEBSOCKET_DRY_RUN if source_mode.lower() in {"ws", "websocket", "ws-dry-run"} else CopySourceMode.POLLING
+        pre_backfill_signals = detect_copy_signals_from_deltas(
+            pre_deltas,
+            settings=settings,
+            followed_wallets=followed,
+            interval_seconds=interval,
+            source_mode=mode,
+            now_timestamp_ms=now_ms(),
+        )
 
     backfill_result = None
     backfill_plan = None
     if network_read:
         if not followed:
-            typer.echo("copy-run network-read refused: no shortlisted leaders available; import or discover full wallet addresses first.")
-            raise typer.Exit(1)
+            typer.echo("copy-run observation-only: no safely scannable leaders this cycle; scanner remains active for next rotation.")
         end_ms = now_ms()
-        if fresh_window_minutes > 0:
-            start_ms = max(0, end_ms - max(1, fresh_window_minutes) * 60_000)
-        else:
-            start_ms = max(0, end_ms - max(1, backfill_days) * 86_400_000)
-        backfill_plan = build_wallet_backfill_plan(
-            settings=settings,
-            wallets=[wallet.wallet_address for wallet in followed],
-            fetch=True,
-            dry_run=False,
-            store_raw=True,
-            start_ms=start_ms,
-            end_ms=end_ms,
-            limit_pages=max(1, max_pages),
-            page_window_ms=settings.collection.user_fills_page_window_ms,
-            recent_fills=True,
-            fills_by_time=True,
-            open_orders=True,
-            frontend_open_orders=True,
-            market_snapshots=True,
-            rebuild_positions=True,
-            position_deltas=True,
-            report=report,
-        )
-        backfill_result = asyncio.run(run_wallet_backfill(backfill_plan, settings))
+        if followed:
+            if fresh_window_minutes > 0:
+                start_ms = max(0, end_ms - max(1, fresh_window_minutes) * 60_000)
+            else:
+                start_ms = max(0, end_ms - max(1, backfill_days) * 86_400_000)
+            backfill_plan = build_wallet_backfill_plan(
+                settings=settings,
+                wallets=[wallet.wallet_address for wallet in followed],
+                fetch=True,
+                dry_run=False,
+                store_raw=True,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                limit_pages=max(1, max_pages),
+                page_window_ms=settings.collection.user_fills_page_window_ms,
+                recent_fills=True,
+                fills_by_time=True,
+                open_orders=True,
+                frontend_open_orders=True,
+                market_snapshots=True,
+                rebuild_positions=True,
+                position_deltas=True,
+                report=report,
+            )
+            try:
+                backfill_result = asyncio.run(run_wallet_backfill(backfill_plan, settings))
+            except SQLAlchemyError as exc:
+                typer.echo(
+                    "copy-run observation-only: runtime database is not writable; "
+                    f"network read/backfill skipped without stopping scanner. reason={exc.__class__.__name__}"
+                )
+                backfill_result = None
+                backfill_plan = None
 
     with session_factory() as session:
         followed_addresses = {wallet.wallet_address.lower() for wallet in followed}
@@ -1210,26 +2663,44 @@ def copy_run_command(
             delta_query = delta_query.filter(PositionDeltaModel.wallet_address.in_(followed_addresses))
         deltas = delta_query.limit(max_deltas).all()
         mode = CopySourceMode.WEBSOCKET_DRY_RUN if source_mode.lower() in {"ws", "websocket", "ws-dry-run"} else CopySourceMode.POLLING
-        signals = detect_copy_signals_from_deltas(
+        post_backfill_signals = detect_copy_signals_from_deltas(
             deltas,
             settings=settings,
             followed_wallets=followed,
             interval_seconds=interval,
             source_mode=mode,
         )
+        signals = (
+            pre_backfill_signals
+            if pre_backfill_signals is not None and pre_backfill_signals.paper_candidates > 0
+            else post_backfill_signals
+        )
     if report:
+        if throughput_plan is not None:
+            typer.echo(format_throughput_plan(throughput_plan))
+            typer.echo("")
         if backfill_result is not None and backfill_plan is not None:
             typer.echo(format_wallet_backfill_report(backfill_result, backfill_plan))
+            typer.echo("")
+        if consensus_selection_report is not None:
+            typer.echo(format_consensus_leader_report(consensus_selection_report))
             typer.echo("")
         typer.echo(format_copy_run_report(leaders=leader_report, signals=signals))
     else:
         suffix = f" network_read_fetched={backfill_result.fetched_items}" if backfill_result is not None else ""
-        typer.echo(f"copy-run dry-run complete: signals={signals.signals_created} paper_candidates={signals.paper_candidates}{suffix}")
+        if throughput_plan is not None and throughput_plan.warnings:
+            suffix += f" throughput={throughput_plan.status}:{throughput_plan.selected_wallets}/{throughput_plan.requested_wallets}"
+        typer.echo(
+            "copy-run dry-run complete: "
+            f"leaders_scanned={len(followed)} signals={signals.signals_created} "
+            f"virtual_entries_accepted={signals.paper_candidates}{suffix}"
+        )
 
 
 @app.command("live-public-scan")
 def live_public_scan_command(
     coins: str = typer.Option("BTC,ETH,SOL,HYPE,DOGE,XRP,BNB,ENA,AVAX,LINK", "--coins"),
+    max_coins: int = typer.Option(40, "--max-coins", help="Maximum trade subscriptions when --coins AUTO/ALL is used."),
     duration_seconds: int = typer.Option(45, "--duration-seconds"),
     max_wallets: int = typer.Option(500, "--max-wallets"),
     min_notional_usdc: float = typer.Option(0.0, "--min-notional-usdc"),
@@ -1243,10 +2714,11 @@ def live_public_scan_command(
     if not network_read:
         typer.echo("live-public-scan refused: --network-read is required for WebSocket reads.")
         raise typer.Exit(1)
+    scan_coins = _resolve_public_trade_scan_coins(settings, coins, max_coins=max_coins)
     result = asyncio.run(
         scan_public_trades_ws(
             settings,
-            coins=normalize_coin_list(coins),
+            coins=scan_coins,
             duration_seconds=duration_seconds,
             max_wallets=max_wallets,
             min_notional_usdc=min_notional_usdc,
@@ -1254,10 +2726,15 @@ def live_public_scan_command(
         )
     )
     if store:
-        session_factory = _session_factory(settings)
-        with session_factory() as session:
-            store_public_trade_scan(session, result, promote_top=promote_top)
-            session.commit()
+        _store_with_sqlite_retry(
+            settings,
+            label="live-public-scan",
+            store_func=lambda session: store_public_trade_scan(
+                session,
+                result,
+                promote_top=promote_top,
+            ),
+        )
     if report:
         typer.echo(format_public_trade_scan_report(result))
     else:
@@ -1265,6 +2742,65 @@ def live_public_scan_command(
             "live-public-scan complete: "
             f"trades={result.trades_seen} wallets={len(result.wallet_stats)} "
             f"promoted={result.wallets_stored} stopped_reason={result.stopped_reason}"
+        )
+
+
+@app.command("live-user-fills-scan")
+def live_user_fills_scan_command(
+    duration_seconds: int = typer.Option(12, "--duration-seconds"),
+    max_users: int = typer.Option(10, "--max-users"),
+    leader_offset: int = typer.Option(0, "--leader-offset"),
+    max_live_fill_age_ms: int = typer.Option(
+        20_000,
+        "--max-live-fill-age-ms",
+        help="Ignore userFills updates older than this local receipt age; 0 disables the guard.",
+    ),
+    wallets: str = typer.Option("", "--wallets", help="Comma-separated complete wallet addresses; defaults to selected top wallets."),
+    network_read: bool = typer.Option(False, "--network-read"),
+    store: bool = typer.Option(False, "--store/--dry-run"),
+    report: bool = typer.Option(True, "--report/--no-report"),
+) -> None:
+    """Watch shortlist userFills over read-only WebSocket; no orders."""
+    settings = _settings()
+    if not network_read:
+        typer.echo("live-user-fills-scan refused: --network-read is required for WebSocket reads.")
+        raise typer.Exit(1)
+    max_users = max(1, min(int(max_users), 10))
+    selected_wallets = [item.strip() for item in wallets.split(",") if item.strip()]
+    if not selected_wallets:
+        session_factory = _session_factory(settings)
+        with session_factory() as session:
+            selected_wallets = [
+                row.wallet_address
+                for row in _selected_top_wallet_rows(session, limit=max_users, offset=leader_offset)
+            ]
+    result = asyncio.run(
+        scan_user_fills_ws(
+            settings,
+            wallets=selected_wallets,
+            duration_seconds=duration_seconds,
+            max_users=max_users,
+            network_read=True,
+        )
+    )
+    if store:
+        _store_with_sqlite_retry(
+            settings,
+            label="live-user-fills-scan",
+            store_func=lambda session: store_user_fills_live_result(
+                session,
+                result,
+                max_live_fill_age_ms=max_live_fill_age_ms,
+            ),
+        )
+    if report:
+        typer.echo(format_user_fills_live_report(result))
+    else:
+        typer.echo(
+            "live-user-fills-scan complete: "
+            f"wallets={len(result.wallets)} fills={result.fills_seen} "
+            f"stale_ignored={result.stale_fills_ignored} "
+            f"deltas={result.deltas_stored} stopped_reason={result.stopped_reason}"
         )
 
 
@@ -1366,6 +2902,21 @@ def testnet_check(
     typer.echo(f"testnet gates validated: {result['cloid']}")
 
 
+@app.command("reset-simulation-state")
+def reset_simulation_state_command(
+    starting_equity: float = typer.Option(1000.0, "--starting-equity", help="Fresh local simulated USDT balance for the next UI session."),
+) -> None:
+    """Reset the local UI simulation session; no orders, no network, no testnet."""
+    settings = _settings()
+    state = reset_simulation_state(settings, starting_equity_usdt=starting_equity)
+    typer.echo("simulation state reset")
+    typer.echo(f"starting_equity_usdt={state.simulation_starting_equity_usdt:.2f}")
+    typer.echo(f"simulation_started_at_ms={state.simulation_started_at_ms}")
+    typer.echo(f"state_path={simulation_state_path(settings)}")
+    typer.echo("paper_local_only=true")
+    typer.echo("orders_created=0")
+
+
 @app.command("ui")
 def ui(
     host: str = typer.Option("127.0.0.1", "--host", help="Local bind host."),
@@ -1380,4 +2931,4 @@ def ui(
     typer.echo(f"Command Center UI: http://{host}:{port}")
     import uvicorn
 
-    uvicorn.run(create_ui_app(settings), host=host, port=port, reload=reload, log_level="info")
+    uvicorn.run(create_ui_app(settings), host=host, port=port, reload=reload, log_level=settings.log_level.lower())

@@ -1,6 +1,6 @@
 # HyperSmart Security Audit Deep
 
-Generated: 2026-05-26T15:26:42.474269+00:00
+Generated: 2026-06-07T17:07:54.866099+00:00
 
 ## Findings
 - OK `no_exchange_path`: matches=0
@@ -8,7 +8,7 @@ Generated: 2026-05-26T15:26:42.474269+00:00
 - OK `no_operational_order`: unexpected_matches=0, locked_refusal_stubs=1
 - OK `no_private_key_config`: No private key material is loaded in HyperSmart config.
 - OK `database_hygiene`: Legacy DB(s) in logs detected and excluded from clean archives: 1
-- OK `archive_hygiene`: Runtime files excluded by clean archive: 538
+- OK `archive_hygiene`: Runtime files excluded by clean archive: 2429
 - OK `secret_scan`: suspicious secret markers: 0
 - OK `dashboard_readonly`: Dashboard contains no dangerous action buttons.
 - OK `explorer_disabled_by_default`: Explorer observer disabled by default.
@@ -21,7 +21,6 @@ Generated: 2026-05-26T15:26:42.474269+00:00
 ## Extended Surfaces
 - src/hl_observer scanned keys: exchange_path, place_order, private_key_literal, sign_call
 - root cmd files: ['CREER_ARCHIVE_PROPRE.cmd', 'LANCER_HYPERSMART.cmd']
-- official bot launcher: `LANCER_HYPERSMART.cmd` only. It forces paper/simulation environment variables, starts the local UI, starts the read-only copy poller, and opens the simulation P&L panel. It does not enable testnet, mainnet, signing, private keys or orders.
 - tools ps1 files: ['tools\\create_clean_archive.ps1', 'tools\\find_locked_runtime_files.ps1', 'tools\\hypersmart_simulation_poll_loop.ps1', 'tools\\start_hypersmart_simulation.ps1']
 - root archives forbidden count: 0
 

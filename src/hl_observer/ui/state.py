@@ -27,6 +27,12 @@ class UiState:
     simulation_processed_delta_keys: set[str] = field(default_factory=set)
     simulation_virtual_positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     simulation_ledger_events: list[dict[str, Any]] = field(default_factory=list)
+    simulation_realized_pnl_usdc: float = 0.0
+    simulation_entry_costs_paid_usdc: float = 0.0
+    simulation_exit_costs_paid_usdc: float = 0.0
+    simulation_reproduced_entries_total: int = 0
+    simulation_reproduced_exits_total: int = 0
+    simulation_equity_history: list[dict[str, Any]] = field(default_factory=list)
 
     def add_event(
         self,

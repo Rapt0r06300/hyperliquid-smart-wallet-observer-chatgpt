@@ -24,7 +24,7 @@ class HyperliquidSettings(BaseModel):
 
 
 class CollectionSettings(BaseModel):
-    default_coins: list[str] = Field(default_factory=lambda: ["BTC", "ETH"])
+    default_coins: list[str] = Field(default_factory=lambda: ["BTC", "ETH", "SOL", "HYPE", "DOGE", "XRP", "BNB", "AVAX", "LINK"])
     request_timeout_seconds: float = 10.0
     retry_count: int = 2
     retry_backoff_seconds: float = 1.0
@@ -145,9 +145,9 @@ class AdaptiveRiskFilterSettings(BaseModel):
     enabled: bool = True
     default_decision: str = "observe_only"
     max_signal_age_ms: int = 3000
-    max_price_moved_bps: float = 30.0
-    max_spread_bps: float = 20.0
-    max_estimated_slippage_bps: float = 25.0
+    max_price_moved_bps: float = 10.0
+    max_spread_bps: float = 10.0
+    max_estimated_slippage_bps: float = 12.0
     min_orderbook_depth_usdc: float = 10000.0
     min_wallet_score: float = 70.0
     min_wallet_coin_score: float = 70.0
@@ -178,15 +178,25 @@ class ExecutionSettings(BaseModel):
 
 
 class RiskSettings(BaseModel):
-    max_signal_age_ms: int = 3500
-    max_spread_bps: float = 6.0
-    max_slippage_bps: float = 10.0
-    min_orderbook_depth_usdc: float = 5000.0
-    min_edge_required_bps: float = 8.0
-    min_wallet_score: float = 75.0
-    min_signal_score: float = 80.0
+    # --- Âge maximal du signal ---
+    # Mode polling (60-120 s/cycle) : les fills ont déjà 1-5 min quand on les lit.
+    # 600 000 ms = 10 minutes (limite douce ; le scorer pénalise déjà la fraîcheur).
+    max_signal_age_ms: int = 3_000
+    max_spread_bps: float = 15.0        # élargi pour paper trading
+    max_slippage_bps: float = 20.0      # élargi pour paper trading
+    min_orderbook_depth_usdc: float = 3_000.0  # abaissé pour altcoins
+    min_edge_required_bps: float = 25.0
+    min_wallet_score: float = 60.0      # abaissé pour paper (was 75)
+    min_signal_score: float = 40.0      # abaissé pour paper (was 80)
     max_testnet_trade_size_usdc: float = 5.0
     kill_switch_active: bool = False
+    # Effective loss-informed defaults. They intentionally override the legacy
+    # loose paper defaults above without removing user history in this file.
+    max_spread_bps: float = 10.0
+    max_slippage_bps: float = 12.0
+    min_orderbook_depth_usdc: float = 5_000.0
+    min_wallet_score: float = 70.0
+    min_signal_score: float = 60.0
 
 
 class CopyTradingSettings(BaseModel):

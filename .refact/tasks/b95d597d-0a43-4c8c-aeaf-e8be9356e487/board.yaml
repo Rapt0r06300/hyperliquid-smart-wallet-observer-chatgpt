@@ -1,0 +1,12 @@
+schema_version: 1
+rev: 0
+columns:
+- id: planned
+  title: Planned
+- id: doing
+  title: Doing
+- id: done
+  title: Done
+- id: failed
+  title: Failed
+cards: []

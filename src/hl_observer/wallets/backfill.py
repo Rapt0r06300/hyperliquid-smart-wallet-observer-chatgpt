@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -11,6 +12,7 @@ from hl_observer.config.settings import Settings
 from hl_observer.hyperliquid.endpoints import info_url_for_settings
 from hl_observer.hyperliquid.rest_info_client import (
     HyperliquidInfoClient,
+    HyperliquidInfoError,
     build_all_mids_payload,
     build_frontend_open_orders_payload,
     build_l2_book_payload,
@@ -283,6 +285,291 @@ async def _collect_market_snapshots(
             result.market_snapshots_stored += 1
 
 
+async def _fetch_single_call(call: Callable[[], Any]) -> tuple[Any | None, Exception | None, int]:
+    started = now_ms()
+    try:
+        payload = await call()
+        return payload, None, now_ms() - started
+    except Exception as exc:
+        return None, exc, now_ms() - started
+
+
+async def _record_backfill_call(
+    repo: CollectionRepository,
+    run_id: int,
+    plan: WalletBackfillPlan,
+    result: WalletBackfillResult,
+    *,
+    item_type: str,
+    request_payload: dict[str, Any],
+    call: Callable[[], Any],
+    wallet_address: str | None = None,
+    coin: str | None = None,
+) -> Any | None:
+    """Fetch one read-only /info payload and persist its health/raw trace.
+
+    The wallet backfill path uses this helper for market snapshots that are
+    collected outside the per-wallet concurrent fetch batch. It never calls an
+    exchange/write endpoint and never creates an execution action.
+    """
+
+    fetched = await _fetch_single_call(call)
+    return _process_fetched_single_call(
+        repo,
+        run_id,
+        plan,
+        result,
+        item_type=item_type,
+        request_payload=request_payload,
+        fetched_data=fetched,
+        wallet_address=wallet_address,
+        coin=coin,
+    )
+
+
+async def _fetch_user_fills_by_time(
+    client: HyperliquidInfoClient,
+    wallet: str,
+    start_ms: int,
+    end_ms: int,
+    page_window_ms: int,
+    limit_pages: int,
+) -> list[tuple[Any | None, Exception | None, int]]:
+    pages_results = []
+    page_index = 0
+    cursor = start_ms
+    seen_page_hashes = set()
+    while cursor < end_ms:
+        if limit_pages is not None and page_index >= limit_pages:
+            break
+        request_end = min(end_ms, cursor + page_window_ms) if page_window_ms else end_ms
+        if request_end <= cursor:
+            break
+        
+        started = now_ms()
+        try:
+            page = await client.user_fills_by_time(
+                wallet,
+                cursor,
+                request_end,
+                aggregate_by_time=False,
+            )
+            latency = now_ms() - started
+            if not page:
+                break
+            page_hash = stable_payload_hash(page)
+            if page_hash in seen_page_hashes:
+                pages_results.append((None, HyperliquidInfoError("Duplicate userFillsByTime page detected"), latency))
+                break
+            seen_page_hashes.add(page_hash)
+            page_index += 1
+            pages_results.append((page, None, latency))
+            
+            if page_window_ms and len(page) < 2000:  # MAX_USER_FILLS_PAGE_SIZE = 2000
+                cursor = request_end + 1
+                continue
+            if not page_window_ms and len(page) < 2000:
+                break
+            page_times = [int(fill["time"]) for fill in page if "time" in fill]
+            if not page_times:
+                break
+            next_cursor = max(page_times) + 1
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+        except Exception as exc:
+            latency = now_ms() - started
+            pages_results.append((None, exc, latency))
+            break
+            
+    return pages_results
+
+
+async def _fetch_wallet_network_data(
+    client: HyperliquidInfoClient,
+    wallet: str,
+    plan: WalletBackfillPlan,
+    start_ms: int,
+    end_ms: int,
+) -> dict[str, Any]:
+    recent_fills_task = None
+    if plan.include_recent_fills:
+        recent_fills_task = asyncio.create_task(_fetch_single_call(lambda: client.user_fills(wallet)))
+        
+    fills_by_time_task = None
+    if plan.include_fills_by_time:
+        fills_by_time_task = asyncio.create_task(
+            _fetch_user_fills_by_time(
+                client,
+                wallet,
+                start_ms,
+                end_ms,
+                plan.page_window_ms,
+                plan.limit_pages,
+            )
+        )
+        
+    open_orders_task = None
+    if plan.include_open_orders:
+        open_orders_task = asyncio.create_task(_fetch_single_call(lambda: client.open_orders(wallet)))
+        
+    frontend_open_orders_task = None
+    if plan.include_frontend_open_orders:
+        frontend_open_orders_task = asyncio.create_task(_fetch_single_call(lambda: client.frontend_open_orders(wallet)))
+        
+    res = {}
+    if recent_fills_task:
+        res["recent_fills"] = await recent_fills_task
+    if fills_by_time_task:
+        res["fills_by_time"] = await fills_by_time_task
+    if open_orders_task:
+        res["open_orders"] = await open_orders_task
+    if frontend_open_orders_task:
+        res["frontend_open_orders"] = await frontend_open_orders_task
+        
+    return res
+
+
+def _process_fetched_single_call(
+    repo: CollectionRepository,
+    run_id: int,
+    plan: WalletBackfillPlan,
+    result: WalletBackfillResult,
+    *,
+    item_type: str,
+    request_payload: dict[str, Any],
+    fetched_data: tuple[Any | None, Exception | None, int],
+    wallet_address: str | None = None,
+    coin: str | None = None,
+) -> Any | None:
+    payload, exc, latency = fetched_data
+    if exc is not None:
+        error_message = str(exc)
+        result.errors_count += 1
+        repo.add_collection_item(
+            run_id=run_id,
+            item_type=item_type,
+            wallet_address=wallet_address,
+            coin=coin,
+            status="error",
+            error_message=error_message,
+        )
+        repo.store_api_health(
+            service=f"hyperliquid_info:{item_type}",
+            ok=False,
+            latency_ms=latency,
+            error=error_message,
+        )
+        if plan.store_raw:
+            repo.store_raw_event(
+                source="hyperliquid",
+                endpoint="/info",
+                request_type=request_payload["type"],
+                request_payload=request_payload,
+                response_payload={"error": error_message},
+                wallet_address=wallet_address,
+                coin=coin,
+                success=False,
+                error_message=error_message,
+            )
+            result.raw_events_stored += 1
+        return None
+
+    repo.add_collection_item(
+        run_id=run_id,
+        item_type=item_type,
+        wallet_address=wallet_address,
+        coin=coin,
+        status="ok",
+    )
+    repo.store_api_health(
+        service=f"hyperliquid_info:{item_type}",
+        ok=True,
+        latency_ms=latency,
+    )
+    if plan.store_raw:
+        repo.store_raw_event(
+            source="hyperliquid",
+            endpoint="/info",
+            request_type=request_payload["type"],
+            request_payload=request_payload,
+            response_payload=payload,
+            wallet_address=wallet_address,
+            coin=coin,
+        )
+        result.raw_events_stored += 1
+    result.fetched_items += 1
+    return payload
+
+
+def _process_fetched_user_fills_by_time(
+    repo: CollectionRepository,
+    run_id: int,
+    plan: WalletBackfillPlan,
+    result: WalletBackfillResult,
+    wallet: str,
+    start_ms: int,
+    end_ms: int,
+    fills_for_rebuild: list[dict[str, Any]],
+    pages_results: list[tuple[Any | None, Exception | None, int]],
+) -> None:
+    if not pages_results:
+        return
+        
+    page_index = 0
+    for page, exc, latency in pages_results:
+        if exc is not None:
+            error_message = str(exc)
+            result.errors_count += 1
+            repo.add_collection_item(
+                run_id=run_id,
+                item_type="userFillsByTime",
+                wallet_address=wallet,
+                status="error",
+                error_message=error_message,
+            )
+            repo.store_api_health(
+                service="hyperliquid_info:userFillsByTime",
+                ok=False,
+                latency_ms=latency,
+                error=error_message,
+            )
+            if plan.store_raw:
+                repo.store_raw_event(
+                    source="hyperliquid",
+                    endpoint="/info",
+                    request_type="userFillsByTime",
+                    request_payload=build_user_fills_by_time_payload(wallet, start_ms, end_ms),
+                    response_payload={"error": error_message},
+                    wallet_address=wallet,
+                    success=False,
+                    error_message=error_message,
+                )
+                result.raw_events_stored += 1
+            break
+            
+        page_index += 1
+        repo.add_collection_item(
+            run_id=run_id,
+            item_type=f"userFillsByTime:{page_index}",
+            wallet_address=wallet,
+            status="ok",
+        )
+        if plan.store_raw:
+            repo.store_raw_event(
+                source="hyperliquid",
+                endpoint="/info",
+                request_type="userFillsByTime",
+                request_payload=build_user_fills_by_time_payload(wallet, start_ms, end_ms),
+                response_payload=page,
+                wallet_address=wallet,
+            )
+            result.raw_events_stored += 1
+        result.fetched_items += 1
+        fills_for_rebuild.extend(page)
+        result.fills_stored += len(repo.store_fills(wallet, page))
+
+
 async def _backfill_wallets(
     client: HyperliquidInfoClient,
     repo: CollectionRepository,
@@ -292,7 +579,15 @@ async def _backfill_wallets(
     start_ms: int,
     end_ms: int,
 ) -> None:
-    for wallet in plan.wallets:
+    # 1. Fetch network data concurrently for all wallets
+    fetch_tasks = [
+        _fetch_wallet_network_data(client, wallet, plan, start_ms, end_ms)
+        for wallet in plan.wallets
+    ]
+    fetched_results = await asyncio.gather(*fetch_tasks)
+
+    # 2. Process and write sequentially to the database
+    for wallet, network_data in zip(plan.wallets, fetched_results):
         repo.ensure_wallet(wallet)
         backfill_run = repo.create_wallet_backfill_run(
             wallet_address=wallet,
@@ -306,32 +601,36 @@ async def _backfill_wallets(
         wallet_open_orders = 0
 
         if plan.include_recent_fills:
-            fills = await _record_backfill_call(
-                repo,
-                run_id,
-                plan,
-                result,
-                item_type="userFills",
-                request_payload=build_user_fills_payload(wallet),
-                wallet_address=wallet,
-                call=lambda wallet=wallet: client.user_fills(wallet),
-            )
-            if isinstance(fills, list):
-                fills_for_rebuild.extend(fills)
-                result.fills_stored += len(repo.store_fills(wallet, fills))
+            fetched_fills = network_data.get("recent_fills")
+            if fetched_fills:
+                fills = _process_fetched_single_call(
+                    repo,
+                    run_id,
+                    plan,
+                    result,
+                    item_type="userFills",
+                    request_payload=build_user_fills_payload(wallet),
+                    fetched_data=fetched_fills,
+                    wallet_address=wallet,
+                )
+                if isinstance(fills, list):
+                    fills_for_rebuild.extend(fills)
+                    result.fills_stored += len(repo.store_fills(wallet, fills))
 
         if plan.include_fills_by_time:
-            await _collect_user_fills_by_time(
-                client,
-                repo,
-                run_id,
-                plan,
-                result,
-                wallet,
-                start_ms,
-                end_ms,
-                fills_for_rebuild,
-            )
+            fetched_fills_by_time = network_data.get("fills_by_time")
+            if fetched_fills_by_time:
+                _process_fetched_user_fills_by_time(
+                    repo,
+                    run_id,
+                    plan,
+                    result,
+                    wallet,
+                    start_ms,
+                    end_ms,
+                    fills_for_rebuild,
+                    fetched_fills_by_time,
+                )
 
         unique_fills = _unique_fills(fills_for_rebuild)
         for fill in unique_fills:
@@ -383,36 +682,40 @@ async def _backfill_wallets(
                 result.best_coin_by_wallet[wallet] = profile.coin
 
         if plan.include_open_orders:
-            orders = await _record_backfill_call(
-                repo,
-                run_id,
-                plan,
-                result,
-                item_type="openOrders",
-                request_payload=build_open_orders_payload(wallet),
-                wallet_address=wallet,
-                call=lambda wallet=wallet: client.open_orders(wallet),
-            )
-            if isinstance(orders, list):
-                stored = repo.store_open_orders(wallet, orders)
-                wallet_open_orders += len(stored)
-                result.open_orders_stored += len(stored)
+            fetched_orders = network_data.get("open_orders")
+            if fetched_orders:
+                orders = _process_fetched_single_call(
+                    repo,
+                    run_id,
+                    plan,
+                    result,
+                    item_type="openOrders",
+                    request_payload=build_open_orders_payload(wallet),
+                    fetched_data=fetched_orders,
+                    wallet_address=wallet,
+                )
+                if isinstance(orders, list):
+                    stored = repo.store_open_orders(wallet, orders)
+                    wallet_open_orders += len(stored)
+                    result.open_orders_stored += len(stored)
 
         if plan.include_frontend_open_orders:
-            frontend_orders = await _record_backfill_call(
-                repo,
-                run_id,
-                plan,
-                result,
-                item_type="frontendOpenOrders",
-                request_payload=build_frontend_open_orders_payload(wallet),
-                wallet_address=wallet,
-                call=lambda wallet=wallet: client.frontend_open_orders(wallet),
-            )
-            if isinstance(frontend_orders, list):
-                stored = repo.store_open_orders(wallet, frontend_orders)
-                wallet_open_orders += len(stored)
-                result.open_orders_stored += len(stored)
+            fetched_frontend = network_data.get("frontend_open_orders")
+            if fetched_frontend:
+                frontend_orders = _process_fetched_single_call(
+                    repo,
+                    run_id,
+                    plan,
+                    result,
+                    item_type="frontendOpenOrders",
+                    request_payload=build_frontend_open_orders_payload(wallet),
+                    fetched_data=fetched_frontend,
+                    wallet_address=wallet,
+                )
+                if isinstance(frontend_orders, list):
+                    stored = repo.store_open_orders(wallet, frontend_orders)
+                    wallet_open_orders += len(stored)
+                    result.open_orders_stored += len(stored)
 
         status = "SUCCESS" if result.errors_count == wallet_errors_before else "PARTIAL"
         if not unique_fills:
@@ -428,151 +731,6 @@ async def _backfill_wallets(
             confidence_score=rebuild.confidence_score,
             notes=";".join(sorted(set(rebuild.notes or result.notes))) or None,
         )
-
-
-async def _collect_user_fills_by_time(
-    client: HyperliquidInfoClient,
-    repo: CollectionRepository,
-    run_id: int,
-    plan: WalletBackfillPlan,
-    result: WalletBackfillResult,
-    wallet: str,
-    start_ms: int,
-    end_ms: int,
-    fills_for_rebuild: list[dict[str, Any]],
-) -> None:
-    page_index = 0
-    started = now_ms()
-    try:
-        async for page in client.iter_user_fills_by_time(
-            wallet,
-            start_ms,
-            end_ms,
-            page_window_ms=plan.page_window_ms,
-            max_pages=plan.limit_pages,
-        ):
-            page_index += 1
-            repo.add_collection_item(
-                run_id=run_id,
-                item_type=f"userFillsByTime:{page_index}",
-                wallet_address=wallet,
-                status="ok",
-            )
-            if plan.store_raw:
-                repo.store_raw_event(
-                    source="hyperliquid",
-                    endpoint="/info",
-                    request_type="userFillsByTime",
-                    request_payload=build_user_fills_by_time_payload(wallet, start_ms, end_ms),
-                    response_payload=page,
-                    wallet_address=wallet,
-                )
-                result.raw_events_stored += 1
-            result.fetched_items += 1
-            fills_for_rebuild.extend(page)
-            result.fills_stored += len(repo.store_fills(wallet, page))
-    except Exception as exc:  # noqa: BLE001 - stored in DB as collection failure.
-        error_message = str(exc)
-        result.errors_count += 1
-        repo.add_collection_item(
-            run_id=run_id,
-            item_type="userFillsByTime",
-            wallet_address=wallet,
-            status="error",
-            error_message=error_message,
-        )
-        repo.store_api_health(
-            service="hyperliquid_info:userFillsByTime",
-            ok=False,
-            latency_ms=now_ms() - started,
-            error=error_message,
-        )
-        if plan.store_raw:
-            repo.store_raw_event(
-                source="hyperliquid",
-                endpoint="/info",
-                request_type="userFillsByTime",
-                request_payload=build_user_fills_by_time_payload(wallet, start_ms, end_ms),
-                response_payload={"error": error_message},
-                wallet_address=wallet,
-                success=False,
-                error_message=error_message,
-            )
-            result.raw_events_stored += 1
-
-
-async def _record_backfill_call(
-    repo: CollectionRepository,
-    run_id: int,
-    plan: WalletBackfillPlan,
-    result: WalletBackfillResult,
-    *,
-    item_type: str,
-    request_payload: dict[str, Any],
-    call: Callable[[], Any],
-    wallet_address: str | None = None,
-    coin: str | None = None,
-) -> Any | None:
-    started = now_ms()
-    try:
-        payload = await call()
-    except Exception as exc:  # noqa: BLE001 - audit trail is stored before continuing.
-        error_message = str(exc)
-        result.errors_count += 1
-        repo.add_collection_item(
-            run_id=run_id,
-            item_type=item_type,
-            wallet_address=wallet_address,
-            coin=coin,
-            status="error",
-            error_message=error_message,
-        )
-        repo.store_api_health(
-            service=f"hyperliquid_info:{item_type}",
-            ok=False,
-            latency_ms=now_ms() - started,
-            error=error_message,
-        )
-        if plan.store_raw:
-            repo.store_raw_event(
-                source="hyperliquid",
-                endpoint="/info",
-                request_type=request_payload["type"],
-                request_payload=request_payload,
-                response_payload={"error": error_message},
-                wallet_address=wallet_address,
-                coin=coin,
-                success=False,
-                error_message=error_message,
-            )
-            result.raw_events_stored += 1
-        return None
-
-    repo.add_collection_item(
-        run_id=run_id,
-        item_type=item_type,
-        wallet_address=wallet_address,
-        coin=coin,
-        status="ok",
-    )
-    repo.store_api_health(
-        service=f"hyperliquid_info:{item_type}",
-        ok=True,
-        latency_ms=now_ms() - started,
-    )
-    if plan.store_raw:
-        repo.store_raw_event(
-            source="hyperliquid",
-            endpoint="/info",
-            request_type=request_payload["type"],
-            request_payload=request_payload,
-            response_payload=payload,
-            wallet_address=wallet_address,
-            coin=coin,
-        )
-        result.raw_events_stored += 1
-    result.fetched_items += 1
-    return payload
 
 
 def _unique_fills(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:

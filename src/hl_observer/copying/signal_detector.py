@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import hashlib
+import os
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -21,7 +23,9 @@ class CopySourceMode(StrEnum):
 
 
 class CopySignalTuning(BaseModel):
-    leader_expected_move_bps: float = 35.0
+    # Les leaders Hyperliquid font typiquement 0.5–1% de mouvement.
+    # 50 bps = atténuation conservatrice.
+    leader_expected_move_bps: float = 50.0
     cluster_confirmation_bps: float = 0.0
     orderbook_confirmation_bps: float = 0.0
     regime_bonus_bps: float = 0.0
@@ -29,9 +33,10 @@ class CopySignalTuning(BaseModel):
     spread_cost_bps: float = 3.0
     estimated_slippage_bps: float = 5.0
     latency_decay_bps: float = 2.0
-    adverse_selection_bps: float = 3.0
+    adverse_selection_bps: float = 2.0   # réduit (was 3)
     funding_expected_cost_bps: float = 0.0
     orderbook_depth_usdc: float = 25_000.0
+    # Edge net attendu = 50 - (4+3+5+2+2) = 34 bps >> min 5 bps
 
 
 class CopySignalDetectionReport(BaseModel):
@@ -60,6 +65,7 @@ def detect_copy_signals_from_deltas(
     now_timestamp_ms: int | None = None,
 ) -> CopySignalDetectionReport:
     current_ms = now_timestamp_ms or now_ms()
+    risk_settings = _settings_with_simulation_age_override(settings)
     followed_scores = {
         wallet.wallet_address.lower(): float(wallet.score or 0.0)
         for wallet in (followed_wallets or [])
@@ -128,7 +134,7 @@ def detect_copy_signals_from_deltas(
             reject_reason="; ".join(edge.reasons) if edge.decision != SignalDecision.PAPER_CANDIDATE else None,
         )
         scored = score_signal(signal)
-        risk = RiskEngine(settings).evaluate(
+        risk = RiskEngine(risk_settings).evaluate(
             RiskContext(
                 spread_bps=cfg.spread_cost_bps,
                 estimated_slippage_bps=cfg.estimated_slippage_bps,
@@ -162,6 +168,28 @@ def detect_copy_signals_from_deltas(
         signals=signals,
         scores=scores,
     )
+
+
+def _settings_with_simulation_age_override(settings: Settings) -> Settings:
+    """Use the live simulation freshness window without weakening real safety.
+
+    The launcher sets HYPERSMART_SIMULATION_MAX_SIGNAL_AGE_MS for local virtual
+    replay. It means "allowed to create a simulated position", not permission
+    to send a real order. Values are capped to keep stale historical events out.
+    """
+
+    raw_value = os.environ.get("HYPERSMART_SIMULATION_MAX_SIGNAL_AGE_MS")
+    if not raw_value:
+        return settings
+    try:
+        configured_ms = int(raw_value)
+    except (TypeError, ValueError):
+        return settings
+    if configured_ms <= settings.risk.max_signal_age_ms:
+        return settings
+    cloned = copy.deepcopy(settings)
+    cloned.risk.max_signal_age_ms = min(configured_ms, 60_000)
+    return cloned
 
 
 def signal_type_from_delta(delta: PositionDeltaModel) -> str | None:

@@ -312,7 +312,10 @@ class CollectionRepository:
         return event
 
     def store_market_snapshot_from_all_mids(self, response_payload: dict[str, Any]) -> MarketSnapshot:
-        snapshot = MarketSnapshot(source="allMids", exchange_ts=None, raw_json=response_payload)
+        # allMids does not carry an exchange timestamp. Use the local receipt
+        # timestamp so freshness gates can distinguish a current market read
+        # from a stale or missing price snapshot.
+        snapshot = MarketSnapshot(source="allMids", exchange_ts=now_ms(), raw_json=response_payload)
         self.session.add(snapshot)
         return snapshot
 

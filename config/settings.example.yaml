@@ -138,15 +138,17 @@ market_universe:
 adaptive_risk_filter:
   enabled: true
   default_decision: observe_only
+  # Simulation/live copy mode: stale signals were the top loss source.
+  # Keep entries inside the ultra-fresh 3s window unless explicitly experimenting.
   max_signal_age_ms: 3000
-  max_price_moved_bps: 30
-  max_spread_bps: 20
-  max_estimated_slippage_bps: 25
-  min_orderbook_depth_usdc: 10000
+  max_price_moved_bps: 10
+  max_spread_bps: 10
+  max_estimated_slippage_bps: 12
+  min_orderbook_depth_usdc: 5000
   min_wallet_score: 70
   min_wallet_coin_score: 70
   min_opening_pattern_score: 65
-  min_pattern_sample_size: 20
+  min_pattern_sample_size: 10
   reduce_size_if_altcoin: true
   reduce_size_if_high_volatility: true
   block_if_wallet_reducing: true
@@ -160,6 +162,17 @@ adaptive_risk_filter:
   max_daily_paper_loss_usdc: 10
   max_coin_exposure_usdc: 20
   max_wallet_exposure_usdc: 20
+
+risk:
+  # Honest simulation default: do not copy stale/weak signals.
+  max_signal_age_ms: 3000
+  max_spread_bps: 10.0
+  max_slippage_bps: 12.0
+  min_orderbook_depth_usdc: 5000.0
+  min_edge_required_bps: 25.0
+  min_wallet_score: 70.0
+  min_signal_score: 60.0
+  kill_switch_active: false
 
 execution:
   enable_mainnet_execution: false

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import gettempdir
 
 from hyper_smart_observer.app.config import AppConfig
 from hyper_smart_observer.audit.archive_audit import audit_archive_readiness
@@ -71,7 +72,7 @@ def write_audit_report(config: AppConfig, output: Path = Path("docs/HYPERSMART_S
     for finding in findings:
         status = "OK" if finding.ok else "FAIL"
         lines.append(f"- {status} `{finding.name}`: {finding.message}")
-    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    output = _write_text_with_fallback(output, "\n".join(lines) + "\n")
     write_deep_audit_report(config)
     return output
 
@@ -113,5 +114,20 @@ def write_deep_audit_report(
     )
     if root_archives:
         lines.append(f"- Root archives detected: {root_archives}")
-    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return output
+    return _write_text_with_fallback(output, "\n".join(lines) + "\n")
+
+
+def _write_text_with_fallback(output: Path, text: str) -> Path:
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(text, encoding="utf-8")
+        return output
+    except OSError as exc:
+        fallback = Path(gettempdir()) / f"hypersmart_{output.name}"
+        fallback.write_text(
+            text
+            + "\n"
+            + f"WARNING: original report path unavailable: {output} ({exc.__class__.__name__}: {exc})\n",
+            encoding="utf-8",
+        )
+        return fallback

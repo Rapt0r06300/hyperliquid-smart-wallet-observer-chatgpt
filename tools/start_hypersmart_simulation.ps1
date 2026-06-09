@@ -1,6 +1,6 @@
 param(
-    [int]$Port = 8792,
-    [int]$IntervalSeconds = 60,
+    [int]$Port = 8794,
+    [int]$IntervalSeconds = 15,
     [int]$MaxLeaders = 50,
     [bool]$RestartExisting = $true,
     [switch]$Interactive
@@ -12,21 +12,54 @@ $Url = "http://127.0.0.1:$Port/#simulationPanel"
 $ApiUrl = "http://127.0.0.1:$Port/api/simulation/overview"
 $logDir = Join-Path $Root "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$runtimeDataDir = Join-Path $Root "runtime\data"
+New-Item -ItemType Directory -Force -Path $runtimeDataDir | Out-Null
+$sessionDbPath = Join-Path $runtimeDataDir "hypersmart_simulation_session.sqlite3"
+$sessionDbUrl = "sqlite:///" + ($sessionDbPath -replace "\\", "/")
+$logsToSendDir = Join-Path $logDir "logs à envoyer"
+New-Item -ItemType Directory -Force -Path $logsToSendDir | Out-Null
 $launcherLog = Join-Path $logDir "hypersmart_launcher.log"
+$uiStdoutLog = Join-Path $logDir "hypersmart_ui_stdout.log"
+$uiStderrLog = Join-Path $logDir "hypersmart_ui_stderr.log"
+$pollerStdoutLog = Join-Path $logDir "hypersmart_poller_stdout.log"
+$pollerStderrLog = Join-Path $logDir "hypersmart_poller_stderr.log"
 $startedProcesses = New-Object System.Collections.Generic.List[int]
 
 function Write-LauncherLog {
     param([string]$Message)
     $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -LiteralPath $launcherLog -Value "[$stamp] $Message"
+    try {
+        Add-Content -LiteralPath $launcherLog -Value "[$stamp] $Message" -ErrorAction Stop
+    } catch {
+        Write-Host "[HyperSmart][log-warning] launcher log unavailable: $($_.Exception.Message)"
+    }
+}
+
+function Test-DirectoryWritable {
+    param([string]$Path)
+    try {
+        New-Item -ItemType Directory -Force -Path $Path -ErrorAction Stop | Out-Null
+        $probe = Join-Path $Path (".hypersmart_launcher_probe_" + [guid]::NewGuid().ToString("N") + ".tmp")
+        Set-Content -LiteralPath $probe -Value "probe" -Encoding UTF8 -ErrorAction Stop
+        Remove-Item -LiteralPath $probe -Force -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 $env:PYTHONPATH = (Join-Path $Root "src") + ";" + $env:PYTHONPATH
 $env:HL_ENV = "paper"
+$env:HL_DATABASE_URL = $sessionDbUrl
 $env:HL_ENABLE_MAINNET_EXECUTION = "0"
 $env:HL_ENABLE_TESTNET_EXECUTION = "0"
 $env:HYPERSMART_MODE = "SIMULATION_ONLY_UNTIL_MANUAL_REVIEW"
 $env:HYPERSMART_POSITIVE_PNL_REQUIRED_FOR_FUTURE_REVIEW = "1"
+$env:HYPERSMART_SIMULATION_INTERVAL_SECONDS = "$IntervalSeconds"
+$env:HYPERSMART_SIMULATION_MAX_SIGNAL_AGE_MS = "120000"
+$env:HYPERSMART_SIMULATION_ALLOW_ADD_AS_ENTRY = "1"
+$env:HYPERSMART_SIMULATION_MIN_EDGE_BPS = "8"
+$env:HL_LOG_LEVEL = "WARNING"
 
 function Test-CommandCenter {
     try {
@@ -51,6 +84,7 @@ function Get-HyperSmartRuntimeProcesses {
                 ($_.CommandLine -like "*python* -m hl_observer ui*") -or
                 ($_.CommandLine -like "*hypersmart_simulation_poll_loop.ps1*") -or
                 ($_.CommandLine -like "*hl_observer copy-run*--network-read*") -or
+                ($_.CommandLine -like "*hl_observer live-user-fills-scan*--network-read*") -or
                 ($_.CommandLine -like "*hl_observer live-public-scan*--network-read*")
             )
         }
@@ -77,7 +111,32 @@ function Stop-HyperSmartRuntime {
 Write-LauncherLine "Lanceur visible actif. port=$Port interval=$IntervalSeconds maxLeaders=$MaxLeaders mode=SIMULATION_ONLY"
 Write-Host "Dashboard: $Url"
 Write-Host "Logs: $launcherLog"
+Write-Host "DB session simulation: $sessionDbPath"
+Write-Host "Logs à envoyer: $logsToSendDir"
+Write-Host "UI logs: $uiStdoutLog / $uiStderrLog"
+Write-Host "Poller logs: $pollerStdoutLog / $pollerStderrLog"
 Write-Host "Aucun ordre reel. Aucun mainnet. Testnet verrouille."
+Write-LauncherLine "DB session simulation active: $sessionDbPath"
+
+$logsToSendWritable = Test-DirectoryWritable -Path $logsToSendDir
+if (-not $logsToSendWritable) {
+    Write-LauncherLine "ALERTE: logs à envoyer non inscriptible. Le PnL/metagraphe peut rester fige tant que ce dossier ou ses fichiers sont verrouilles."
+    Write-Host "Action propre: fermer les anciennes fenetres HyperSmart, puis relancer ce lanceur. Aucun processus n'est tue pour resoudre ce verrou."
+} else {
+    Write-LauncherLine "Diagnostic runtime: logs à envoyer inscriptible."
+}
+
+try {
+    Push-Location $Root
+    $writeCheckOutput = & python -m hl_observer runtime-write-check --from-logs "$logsToSendDir" --stale-after-seconds 60 2>&1
+    foreach ($line in $writeCheckOutput) { Write-LauncherLog $line }
+    $readinessOutput = & python -m hl_observer simulation-readiness --from-logs "$logsToSendDir" --fresh-window-seconds 120 2>&1
+    foreach ($line in $readinessOutput) { Write-LauncherLog $line }
+    Pop-Location
+} catch {
+    Write-LauncherLog "runtime diagnostics failed: $($_.Exception.Message)"
+    try { Pop-Location } catch {}
+}
 
 if ($RestartExisting) {
     try {
@@ -85,6 +144,14 @@ if ($RestartExisting) {
         foreach ($process in $stale) {
             Write-LauncherLine "Arret ancien processus HyperSmart pid=$($process.ProcessId)"
             Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        for ($wait = 0; $wait -lt 30; $wait++) {
+            $remaining = @(Get-HyperSmartRuntimeProcesses)
+            if ($remaining.Count -eq 0) {
+                break
+            }
+            Write-LauncherLog "Waiting for old HyperSmart runtime processes to exit: $($remaining.Count) remaining"
+            Start-Sleep -Milliseconds 500
         }
     } catch {
         Write-LauncherLog "stale process cleanup skipped: $($_.Exception.Message)"
@@ -95,6 +162,12 @@ try {
     Push-Location $Root
     $initOutput = & python -m hl_observer init-db 2>&1
     foreach ($line in $initOutput) { Write-LauncherLog $line }
+    $resetOutput = & python -m hl_observer reset-simulation-state --starting-equity 1000 2>&1
+    foreach ($line in $resetOutput) { Write-LauncherLog $line }
+    Write-LauncherLine "Nouvelle session simulation: capital virtuel remis a 1000 USDT pour ce lancement."
+    Write-LauncherLine "Decouverte read-only des marches Hyperliquid pour scanner davantage de coins."
+    $marketsOutput = & python -m hl_observer discover-markets --store --max-coins 80 2>&1
+    foreach ($line in $marketsOutput) { Write-LauncherLog $line }
     Pop-Location
 } catch {
     Write-LauncherLog "init-db failed: $($_.Exception.Message)"
@@ -107,7 +180,7 @@ if (-not (Test-CommandCenter)) {
         "-m", "hl_observer", "ui",
         "--host", "127.0.0.1",
         "--port", "$Port"
-    ) -WorkingDirectory $Root
+    ) -WorkingDirectory $Root -RedirectStandardOutput $uiStdoutLog -RedirectStandardError $uiStderrLog
     if ($uiProcess -and $uiProcess.Id) {
         $startedProcesses.Add([int]$uiProcess.Id) | Out-Null
     }
@@ -117,7 +190,8 @@ $pollerAlreadyRunning = $false
 try {
     $pollers = Get-CimInstance Win32_Process | Where-Object {
         ($_.CommandLine -like "*hypersmart_simulation_poll_loop.ps1*") -or
-        ($_.CommandLine -like "*hl_observer copy-run*--network-read*")
+        ($_.CommandLine -like "*hl_observer copy-run*--network-read*") -or
+        ($_.CommandLine -like "*hl_observer live-user-fills-scan*--network-read*")
     }
     $pollerAlreadyRunning = @($pollers).Count -gt 0
 } catch {
@@ -134,14 +208,18 @@ if (-not $pollerAlreadyRunning) {
         "-Root", "`"$Root`"",
         "-IntervalSeconds", "$IntervalSeconds",
         "-MaxLeaders", "$MaxLeaders",
-        "-LeadersPerPoll", "5",
+        "-LeadersPerPoll", "10",
         "-BackfillDays", "1",
-        "-FreshWindowMinutes", "15",
+        "-FreshWindowMinutes", "1",
         "-MaxPages", "1",
-        "-PublicTradeScanSeconds", "20",
-        "-PublicTradeMaxWallets", "1500"
+        "-PublicTradeCoins", "AUTO",
+        "-PublicTradeMaxCoins", "40",
+        "-PublicTradeScanSeconds", "10",
+        "-PublicTradeMaxWallets", "10000",
+        "-PublicTradeScanEveryPolls", "1",
+        "-UserFillsMaxLiveAgeMs", "120000"
     ) -join " "
-    $pollProcess = Start-Process -NoNewWindow -PassThru -FilePath "powershell" -ArgumentList $pollArguments -WorkingDirectory $Root
+    $pollProcess = Start-Process -NoNewWindow -PassThru -FilePath "powershell" -ArgumentList $pollArguments -WorkingDirectory $Root -RedirectStandardOutput $pollerStdoutLog -RedirectStandardError $pollerStderrLog
     if ($pollProcess -and $pollProcess.Id) {
         $startedProcesses.Add([int]$pollProcess.Id) | Out-Null
     }
