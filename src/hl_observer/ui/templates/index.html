@@ -34,7 +34,21 @@
       <section class="panel data-watch hero-simulation" id="simulationPanel">
         <div class="panel-title">
           <span class="dot green pulse"></span>
-          <h2>Simulation du bot - gain/perte</h2>
+          <h2>dYdX v4 — Simulation paper copy-trading</h2>
+          <span id="dydxEngineBadge" class="badge orange" style="margin-left:auto">DEMARRAGE...</span>
+        </div>
+        <!-- Panneau dYdX live -->
+        <div id="dydxLivePanel" style="background:rgba(0,255,180,.04);border:1px solid rgba(0,255,180,.18);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px">
+          <div style="display:flex;flex-wrap:wrap;gap:10px" id="dydxMetrics">
+            <div class="simulation-metric"><span>PnL dYdX paper</span><strong id="dydxPnl">$0.00</strong></div>
+            <div class="simulation-metric"><span>Equity</span><strong id="dydxEquity">$1000.00</strong></div>
+            <div class="simulation-metric"><span>Trades</span><strong id="dydxTrades">0</strong></div>
+            <div class="simulation-metric"><span>Winrate</span><strong id="dydxWinrate">—</strong></div>
+            <div class="simulation-metric"><span>Positions ouvertes</span><strong id="dydxOpenPos">0</strong></div>
+            <div class="simulation-metric"><span>Wallets suivis</span><strong id="dydxWallets">0</strong></div>
+          </div>
+          <div id="dydxPositionsList" style="margin-top:8px;font-size:12px;opacity:.85"></div>
+          <div style="margin-top:6px;font-size:11px;opacity:.5">dYdX v4 Indexer REST — READ-ONLY — PAPER ONLY — 0 ordre reel</div>
         </div>
         <p class="section-help">
           Vue principale volontairement reduite au resultat du bot simule. Le P&L demarre a 0, ignore les anciens evenements,
@@ -354,5 +368,91 @@
       </section>
     </main>
     <script src="/static/app.js?v=simulation-ui-20260603-audit-compact-v4"></script>
+    <script>
+    // ── dYdX v4 live panel ───────────────────────────────────────────────────
+    (function() {
+      var fmt = function(v) { return (v >= 0 ? "+" : "") + "$" + Math.abs(v).toFixed(2); };
+      var fmtUsd = function(v) { return "$" + Number(v).toFixed(2); };
+      var badge = document.getElementById("dydxEngineBadge");
+      var pnlEl = document.getElementById("dydxPnl");
+      var eqEl = document.getElementById("dydxEquity");
+      var trEl = document.getElementById("dydxTrades");
+      var wrEl = document.getElementById("dydxWinrate");
+      var opEl = document.getElementById("dydxOpenPos");
+      var wlEl = document.getElementById("dydxWallets");
+      var posList = document.getElementById("dydxPositionsList");
+
+      function colorClass(v) { return Number(v) >= 0 ? "color:#00ffb4" : "color:#ff4444"; }
+
+      async function refreshDydx() {
+        try {
+          var [status, positions, wallets] = await Promise.all([
+            fetch("/api/dydx/status").then(function(r){return r.json();}),
+            fetch("/api/dydx/positions").then(function(r){return r.json();}),
+            fetch("/api/dydx/wallets").then(function(r){return r.json();})
+          ]);
+
+          // Badge engine
+          if (badge) {
+            badge.textContent = status.running ? "LIVE" : "ARRETE";
+            badge.style.background = status.running ? "#00ffb4" : "#ff4444";
+            badge.style.color = status.running ? "#000" : "#fff";
+          }
+
+          // Métriques PnL
+          var pnl = Number(status.net_pnl_usdt || 0);
+          var eq = Number(status.equity_usdt || 1000);
+          if (pnlEl) { pnlEl.textContent = fmt(pnl); pnlEl.style.cssText = colorClass(pnl); }
+          if (eqEl) { eqEl.textContent = fmtUsd(eq); }
+          if (trEl) { trEl.textContent = status.total_trades || 0; }
+          if (wrEl) { wrEl.textContent = status.winrate || "0%"; }
+          if (opEl) { opEl.textContent = (positions||[]).length; }
+          if (wlEl) { wlEl.textContent = (wallets||[]).length; }
+
+          // Positions ouvertes
+          if (posList) {
+            if (!positions || positions.length === 0) {
+              posList.innerHTML = "<em style=\"opacity:.4\">Aucune position ouverte — en attente de cluster signal</em>";
+            } else {
+              posList.innerHTML = positions.map(function(p) {
+                return "<span style=\"background:rgba(255,255,255,.06);border-radius:4px;padding:2px 8px;margin:2px;display:inline-block\">"
+                  + "<b>" + (p.market_id||"") + "</b> "
+                  + "<span style=\"color:" + (p.side==="LONG"?"#00ffb4":"#ff8844") + "\">" + (p.side||"") + "</span> "
+                  + "entry=" + (p.entry_price||0).toFixed(2)
+                  + " SL=" + (p.stop_loss||0).toFixed(2)
+                  + " TP=" + (p.take_profit||0).toFixed(2)
+                  + " wallets=" + (p.wallet_count||0)
+                  + "</span>";
+              }).join("");
+            }
+          }
+
+          // Mettre à jour aussi le summary principal
+          var summary = document.getElementById("simulationSummary");
+          if (summary && status.running) {
+            var metrics = [
+              ["Gain/perte dYdX paper", fmt(pnl)],
+              ["Equity dYdX", fmtUsd(eq) + " USDT"],
+              ["Trades fermes", String(status.total_trades || 0)],
+              ["Winrate", status.winrate || "0%"],
+              ["Positions ouvertes", String((positions||[]).length)],
+              ["Wallets scores", String((wallets||[]).length)]
+            ];
+            summary.innerHTML = metrics.map(function(m) {
+              return "<div class=\"simulation-metric\"><span>" + m[0] + "</span><strong>" + m[1] + "</strong></div>";
+            }).join("");
+          }
+
+        } catch(e) {
+          if (badge) { badge.textContent = "ERREUR"; badge.style.background = "#ff4444"; }
+          console.warn("dYdX panel refresh error:", e);
+        }
+      }
+
+      // Poll toutes les 3 secondes
+      refreshDydx();
+      setInterval(refreshDydx, 3000);
+    })();
+    </script>
   </body>
 </html>

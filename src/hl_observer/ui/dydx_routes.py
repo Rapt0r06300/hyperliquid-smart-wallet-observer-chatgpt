@@ -1,0 +1,96 @@
+"""
+Routes FastAPI dYdX v4 — READ-ONLY, PAPER-ONLY.
+
+Aucun endpoint de trading, aucune clé privée, aucun ordre réel.
+Toutes les données viennent du DydxEngine (paper simulation + public Indexer).
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from fastapi import APIRouter
+
+logger = logging.getLogger(__name__)
+
+DISCLAIMER = (
+    "dYdX v4 PAPER SIMULATION — READ-ONLY public Indexer API. "
+    "No real orders. No real money. No private keys."
+)
+
+
+def create_dydx_router() -> APIRouter:
+    router = APIRouter(prefix="/api/dydx", tags=["dydx-v4"])
+
+    # Import ici pour éviter les imports circulaires au démarrage
+    from hyper_smart_observer.dydx_v4.engine import get_engine
+
+    @router.get("/status")
+    async def dydx_status() -> dict[str, Any]:
+        """Statut du moteur dYdX v4 (paper-only)."""
+        try:
+            return get_engine().get_status()
+        except Exception as e:
+            logger.error("dydx /status error: %s", e)
+            return {
+                "running": False,
+                "error": str(e),
+                "disclaimer": DISCLAIMER,
+            }
+
+    @router.get("/wallets")
+    async def dydx_wallets() -> list[dict]:
+        """Shortlist des wallets dYdX v4 suivis (Cosmos LCD + Indexer score)."""
+        try:
+            return get_engine().get_wallets()
+        except Exception as e:
+            logger.error("dydx /wallets error: %s", e)
+            return []
+
+    @router.get("/positions")
+    async def dydx_positions() -> list[dict]:
+        """Positions paper ouvertes (stop-loss -1.5%, take-profit +2.5%)."""
+        try:
+            return get_engine().get_open_positions()
+        except Exception as e:
+            logger.error("dydx /positions error: %s", e)
+            return []
+
+    @router.get("/trades")
+    async def dydx_trades(limit: int = 50) -> list[dict]:
+        """Historique des trades paper fermés (stop-loss ou take-profit)."""
+        try:
+            return get_engine().get_closed_trades(limit=min(limit, 200))
+        except Exception as e:
+            logger.error("dydx /trades error: %s", e)
+            return []
+
+    @router.get("/prices")
+    async def dydx_prices() -> dict[str, float]:
+        """Prix oracle dYdX v4 (ETH-USD, BTC-USD, SOL-USD…)."""
+        try:
+            return get_engine().get_mark_prices()
+        except Exception as e:
+            logger.error("dydx /prices error: %s", e)
+            return {}
+
+    @router.get("/pnl")
+    async def dydx_pnl() -> dict[str, Any]:
+        """Résumé PnL paper session courante."""
+        try:
+            s = get_engine().get_status()
+            return {
+                "session_id": s.get("session_id", ""),
+                "net_pnl_usdt": s.get("net_pnl_usdt", 0.0),
+                "equity_usdt": s.get("equity_usdt", 1000.0),
+                "total_trades": s.get("total_trades", 0),
+                "winrate": s.get("winrate", "0%"),
+                "fees_paid": s.get("fees_paid", 0.0),
+                "open_positions": s.get("open_positions", 0),
+                "disclaimer": DISCLAIMER,
+            }
+        except Exception as e:
+            logger.error("dydx /pnl error: %s", e)
+            return {"error": str(e), "disclaimer": DISCLAIMER}
+
+    return router
