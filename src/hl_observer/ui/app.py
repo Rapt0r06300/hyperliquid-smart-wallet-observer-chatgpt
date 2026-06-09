@@ -22,7 +22,7 @@ def create_ui_app(settings: Settings | None = None, state: UiState | None = None
     init_db(settings.database_url)
     state = state or load_or_create_ui_state(settings)
     bus = UiEventBus()
-    app = FastAPI(title="Hyperliquid Smart-Wallet Observer Command Center")
+    app = FastAPI(title="HyperSmart Observer — dYdX v4 Command Center")
     static_dir = Path(__file__).with_name("static")
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
     app.include_router(create_router(settings, state, bus))

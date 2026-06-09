@@ -1614,7 +1614,7 @@ def create_router(settings: Settings, state: UiState, bus: UiEventBus) -> APIRou
         ]
         safety_status = "STOPPED" if state.kill_switch_active else ("SAFE" if audit.ok else "WARNING")
         return UiStatus(
-            app_name="Hyperliquid Smart-Wallet Observer",
+            app_name="HyperSmart Observer — dYdX v4",
             version=__version__,
             mode=settings.environment.value.upper(),
             db_path=settings.database_url,
@@ -2623,10 +2623,10 @@ def create_router(settings: Settings, state: UiState, bus: UiEventBus) -> APIRou
         leaderboard = _leaderboard_summary()
         explorer = _explorer_summary()
         return {
-            "title": "Recherche automatique des meilleurs wallets",
+            "title": "dYdX v4 Smart-Wallet Observer",
             "subtitle": (
-                "Le logiciel cherche automatiquement les meilleurs wallets Hyperliquid, notamment via le leaderboard, "
-                "puis analyse positions, ouvertures, fermetures, profits, altcoins, methodologies et signaux paper."
+                "Le logiciel analyse les wallets dYdX v4 via Cosmos LCD + Indexer (REST/WS), "
+                "detecte les clusters de wallets vers la meme direction, et genere des signaux paper (0 ordre reel)."
             ),
             "mode": settings.environment.value.upper(),
             "autoscan": _autoscan_summary(),
