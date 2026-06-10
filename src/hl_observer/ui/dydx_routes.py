@@ -93,4 +93,25 @@ def create_dydx_router() -> APIRouter:
             logger.error("dydx /pnl error: %s", e)
             return {"error": str(e), "disclaimer": DISCLAIMER}
 
+    @router.get("/health")
+    async def dydx_health() -> dict[str, Any]:
+        """Health check + état de la découverte de wallets."""
+        try:
+            s = get_engine().get_status()
+            discovery_state = (
+                "running" if s.get("last_error") == "DISCOVERY_RUNNING"
+                else "idle"
+            )
+            return {
+                "running": s.get("running", False),
+                "rest_healthy": s.get("rest_healthy", False),
+                "discovery": discovery_state,
+                "wallets": s.get("wallets_in_shortlist", 0),
+                "iteration": s.get("iteration", 0),
+                "last_error": s.get("last_error", ""),
+                "disclaimer": DISCLAIMER,
+            }
+        except Exception as e:
+            return {"running": False, "error": str(e), "disclaimer": DISCLAIMER}
+
     return router
