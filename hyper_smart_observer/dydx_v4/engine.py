@@ -49,6 +49,8 @@ class EngineStatus:
     last_error: str = ""
     disclaimer: str = DISCLAIMER
     session_id: str = ""
+    no_trade_reasons: dict = field(default_factory=dict)
+    leader_exits: int = 0
 
 
 class DydxEngine:
@@ -66,9 +68,10 @@ class DydxEngine:
         self._config = config or load_config_from_env()
         # Par défaut: mainnet READ-ONLY pour scanner les vrais wallets
         if self._config.network.value == "testnet" and not config:
-            from hyper_smart_observer.dydx_v4.config import DydxNetwork
             import dataclasses
-            self._config = dataclasses.replace(self._config, network=DydxNetwork.MAINNET, require_testnet=False)
+            self._config = dataclasses.replace(
+                self._config, network=DydxNetwork.MAINNET, require_testnet=False
+            )
         assert_paper_only(self._config)
 
         self._rest = DydxIndexerRestClient(
@@ -92,7 +95,9 @@ class DydxEngine:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._status = EngineStatus(
-            network=str(self._config.network) if hasattr(self._config.network, 'value') else self._config.network,
+            network=str(self._config.network.value)
+            if hasattr(self._config.network, "value")
+            else str(self._config.network),
             rest_url=self._config.indexer_rest_url,
         )
 
@@ -140,6 +145,10 @@ class DydxEngine:
                 "last_error": s.last_error,
                 "disclaimer": s.disclaimer,
                 "session_id": s.session_id,
+                "no_trade_reasons": dict(
+                    sorted(s.no_trade_reasons.items(), key=lambda x: -x[1])[:10]
+                ),
+                "leader_exits": s.leader_exits,
             }
 
     def get_wallets(self) -> list[dict]:
@@ -220,15 +229,24 @@ class DydxEngine:
             self._status.started_at_ms = int(time.time() * 1000)
             self._status.session_id = self._observer.stats.session_id
 
-        # Patch: hook pour mettre à jour le status à chaque itération
-        original_run = self._observer._poll_wallets
+        # Patch: hook _poll_shortlist (nom exact) pour sync stats après chaque itération
+        original_poll = self._observer._poll_shortlist
 
         def _patched_poll(*args, **kwargs):
-            result = original_run(*args, **kwargs)
+            result = original_poll(*args, **kwargs)
             self._sync_stats()
             return result
 
-        self._observer._poll_wallets = _patched_poll
+        self._observer._poll_shortlist = _patched_poll
+
+        # Timer de sync de secours: toutes les 3s (couvre discovery_running + positions)
+        def _sync_timer():
+            while self._observer and self._status.running:
+                self._sync_stats()
+                time.sleep(3.0)
+
+        sync_thread = threading.Thread(target=_sync_timer, name="dydx-sync", daemon=True)
+        sync_thread.start()
 
         try:
             self._observer.run()  # bloquant jusqu'à stop()
@@ -257,6 +275,17 @@ class DydxEngine:
             self._status.signals_refused = s.signals_refused
             self._status.stale_refused = s.stale_signals_refused
             self._status.fees_paid = s.total_fees_paid
+            # Injecter discovery_running dans last_error (UI feedback)
+            if self._observer._discovery_running:
+                self._status.last_error = "DISCOVERY_RUNNING"
+            elif self._status.last_error == "DISCOVERY_RUNNING":
+                self._status.last_error = ""
+            # no_trade_reasons + leader_exits (viral bot)
+            self._status.no_trade_reasons = dict(self._observer._no_trade_reasons)
+            self._status.leader_exits = sum(
+                1 for t in self._observer._closed_trades
+                if t.get("reason") == "LEADER_EXIT"
+            )
 
 
 # Singleton global — thread-safe via .start()

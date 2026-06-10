@@ -3,8 +3,8 @@ Découverte et scoring de wallets dYdX v4.
 
 Basé sur l'analyse de 1,482,013 events Hyperliquid:
 - ETH-USD = seul coin prouvé rentable (+$9.07 net), signal age moyen 3s
-- Signal frais (<4s) = critique pour éviter NO_MATCHING refusals (47% des refus)
-- 1-2 wallets de qualité > 7 wallets stale (winrate: 41% vs 10%)
+- Signal frais (<4s) = critique pour éviter NO_MATCHING refusals (47%% des refus)
+- 1-2 wallets de qualité > 7 wallets stale (winrate: 41%% vs 10%%)
 
 READ-ONLY. Aucun ordre. Aucune clé privée.
 """
@@ -22,50 +22,38 @@ from hyper_smart_observer.dydx_v4.cosmos_client import (
     LIQUID_MARKETS,
 )
 from hyper_smart_observer.dydx_v4.rest_client import DydxIndexerRestClient, RestError
+from hyper_smart_observer.dydx_v4.scoring import compute_account_score, TradeRecord
 
 logger = logging.getLogger(__name__)
 
-# Marchés prioritaires prouvés sur l'analyse HL (signal age le plus bas)
 PRIORITY_MARKETS = ["ETH-USD", "BTC-USD", "SOL-USD", "TIA-USD"]
 
-# Marchés à éviter (prouvés perdants dans l'analyse ou non supportés dYdX)
 BLOCKED_MARKETS = frozenset([
     "CASH:WTI", "CASH:TSLA", "CASH:SILVER", "CASH:GOLD",
     "XYZ:CL", "XYZ:AMD", "XYZ:ORCL", "HYPE", "ZEC",
 ])
 
-# Scores ETH > BTC > SOL (basé sur PnL prouvé de l'analyse)
 MARKET_PRIORITY_SCORE = {
-    "ETH-USD": 1.0,
-    "BTC-USD": 0.8,
-    "SOL-USD": 0.6,
-    "TIA-USD": 0.5,
-    "AVAX-USD": 0.4,
-    "BNB-USD": 0.4,
-    "ARB-USD": 0.3,
-    "OP-USD": 0.3,
+    "ETH-USD": 1.0, "BTC-USD": 0.8, "SOL-USD": 0.6, "TIA-USD": 0.5,
+    "AVAX-USD": 0.4, "BNB-USD": 0.4, "ARB-USD": 0.3, "OP-USD": 0.3,
 }
 
 
 @dataclass
 class WalletScore:
-    """Score d'un wallet pour le copy-trading."""
     address: str
     subaccount_number: int = 0
     usdc_balance: float = 0.0
     open_positions: list[dict] = field(default_factory=list)
     total_score: float = 0.0
-    # Métriques Indexer (si disponibles)
     net_pnl_usdc: float = 0.0
     winrate: float = 0.0
     profit_factor: float = 1.0
     trade_count: int = 0
-    # Qualité de la découverte
     market_priority_score: float = 0.0
     balance_score: float = 0.0
     position_count_score: float = 0.0
     freshness_score: float = 1.0
-    # Métadonnées
     discovered_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     last_updated_ms: int = field(default_factory=lambda: int(time.time() * 1000))
     source: str = "cosmos_lcd"
@@ -74,7 +62,6 @@ class WalletScore:
 
 @dataclass
 class DiscoveryResult:
-    """Résultat d'un run de découverte."""
     run_id: str
     started_at_ms: int
     finished_at_ms: int
@@ -90,13 +77,6 @@ class DiscoveryResult:
 class DydxWalletDiscovery:
     """
     Découverte et scoring de wallets dYdX v4.
-
-    Stratégie basée sur l'analyse empirique:
-    1. Cosmos LCD → trouver wallets avec positions ouvertes sur marchés prioritaires
-    2. Indexer REST → backfill fills et calcul PnL historique
-    3. Scorer par: balance, marchés prioritaires, freshness, PnL historique
-    4. Retourner shortlist triée pour le live_observer
-
     READ-ONLY. Pas d'ordre. Pas de clé privée.
     """
 
@@ -108,79 +88,86 @@ class DydxWalletDiscovery:
         self,
         cosmos_client: DydxCosmosLcdClient,
         rest_client: DydxIndexerRestClient,
-        min_usdc_balance: float = 5_000.0,
-        max_scan_pages: int = 30,
+        min_usdc_balance: float = 1_000.0,
+        max_scan_pages: int = 10,
     ) -> None:
         self.cosmos = cosmos_client
         self.rest = rest_client
         self.min_usdc = min_usdc_balance
         self.max_scan_pages = max_scan_pages
 
-    def discover_top_wallets(self, n: int = 20) -> DiscoveryResult:
-        """
-        Découvrir les N meilleurs wallets à suivre.
-
-        1. Scan Cosmos LCD (tous les subaccounts avec positions)
-        2. Filtrer par balance + marchés prioritaires
-        3. Scorer chaque candidat
-        4. Retourner top N
-
-        Returns:
-            DiscoveryResult avec shortlist (paper-only, jamais d'ordres)
-        """
+    def fast_discover(self, n: int = 20) -> DiscoveryResult:
+        """Découverte rapide < 10s. Paper-only. Aucun ordre."""
         import hashlib
-
         started = int(time.time() * 1000)
-        run_id = hashlib.sha256(f"discovery:{started}".encode()).hexdigest()[:16]
+        run_id = hashlib.sha256(f"fast:{started}".encode()).hexdigest()[:16]
+        logger.info("fast_discover START run_id=%s n=%d", run_id, n)
 
-        logger.info("Wallet discovery START run_id=%s n=%d", run_id, n)
-
-        # 1. Scan on-chain
-        candidates: list[OnChainSubaccount] = self.cosmos.scan_subaccounts(
-            max_pages=self.max_scan_pages,
-            min_usdc=self.min_usdc,
-            only_with_positions=True,
+        candidates = self.cosmos.scan_subaccounts(
+            max_pages=3, page_size=100, min_usdc=500.0, only_with_positions=True,
         )
+        logger.info("fast_discover scan: %d candidats", len(candidates))
 
-        logger.info("Cosmos scan: %d candidats avec positions", len(candidates))
-
-        # 2. Filtrer et scorer
-        scored: list[WalletScore] = []
+        scored = []
         for sub in candidates:
             ws = self._score_wallet(sub)
             if ws.total_score > 0:
                 scored.append(ws)
 
-        # 3. Enrichir top 50 avec données Indexer (fills historiques)
         scored.sort(key=lambda x: x.total_score, reverse=True)
-        top_to_enrich = scored[:50]
-
-        for ws in top_to_enrich:
+        for ws in scored[:5]:
             self._enrich_with_indexer(ws)
+        scored.sort(key=lambda x: x.total_score, reverse=True)
+        shortlist = scored[:n]
 
-        # 4. Re-trier après enrichissement
+        finished = int(time.time() * 1000)
+        logger.info(
+            "fast_discover DONE: %d wallets en %.1fs | %s",
+            len(shortlist), (finished - started) / 1000, self.DISCLAIMER,
+        )
+        return DiscoveryResult(
+            run_id=run_id, started_at_ms=started, finished_at_ms=finished,
+            candidates_scanned=len(candidates), shortlisted=shortlist,
+            discovery_method="fast_cosmos_lcd",
+        )
+
+    def discover_top_wallets(self, n: int = 20) -> DiscoveryResult:
+        """Découverte complète (lente). Paper-only. Aucun ordre."""
+        import hashlib
+        started = int(time.time() * 1000)
+        run_id = hashlib.sha256(f"discovery:{started}".encode()).hexdigest()[:16]
+        logger.info("Wallet discovery START run_id=%s n=%d", run_id, n)
+
+        candidates = self.cosmos.scan_subaccounts(
+            max_pages=self.max_scan_pages, min_usdc=self.min_usdc, only_with_positions=True,
+        )
+        logger.info("Cosmos scan: %d candidats avec positions", len(candidates))
+
+        scored = []
+        for sub in candidates:
+            ws = self._score_wallet(sub)
+            if ws.total_score > 0:
+                scored.append(ws)
+
+        scored.sort(key=lambda x: x.total_score, reverse=True)
+        for ws in scored[:50]:
+            self._enrich_with_indexer(ws)
         scored.sort(key=lambda x: x.total_score, reverse=True)
         shortlist = scored[:n]
 
         finished = int(time.time() * 1000)
         result = DiscoveryResult(
-            run_id=run_id,
-            started_at_ms=started,
-            finished_at_ms=finished,
-            candidates_scanned=len(candidates),
-            shortlisted=shortlist,
+            run_id=run_id, started_at_ms=started, finished_at_ms=finished,
+            candidates_scanned=len(candidates), shortlisted=shortlist,
         )
-
         logger.info(
             "Discovery DONE run_id=%s candidates=%d shortlisted=%d elapsed_s=%.1f | %s",
             run_id, len(candidates), len(shortlist),
-            (finished - started) / 1000, self.DISCLAIMER
+            (finished - started) / 1000, self.DISCLAIMER,
         )
-
         return result
 
     def _score_wallet(self, sub: OnChainSubaccount) -> WalletScore:
-        """Calculer le score initial basé sur les données on-chain seulement."""
         ws = WalletScore(
             address=sub.address,
             subaccount_number=sub.subaccount_number,
@@ -190,17 +177,14 @@ class DydxWalletDiscovery:
                 for p in sub.positions
             ],
         )
-
-        # Score balance: log scale, capé à 1.0 à $1M
         import math
         ws.balance_score = min(1.0, math.log10(max(1, sub.usdc_balance)) / 6.0)
 
-        # Score marchés prioritaires
         market_scores = []
         for pos in sub.positions:
             market = pos.market_id
             if market in BLOCKED_MARKETS:
-                return ws  # score=0 → exclu
+                return ws
             ms = MARKET_PRIORITY_SCORE.get(market, 0.1)
             market_scores.append(ms)
 
@@ -209,7 +193,6 @@ class DydxWalletDiscovery:
 
         ws.market_priority_score = sum(market_scores) / len(market_scores)
 
-        # Score nb positions (1-3 positions = focus, >5 = diversifié/moins copy-friendly)
         n_pos = sub.total_position_count
         if n_pos == 0:
             ws.position_count_score = 0.0
@@ -220,21 +203,15 @@ class DydxWalletDiscovery:
         else:
             ws.position_count_score = 0.4
 
-        # Score total (sans Indexer)
         ws.total_score = (
             0.35 * ws.balance_score +
             0.40 * ws.market_priority_score +
             0.25 * ws.position_count_score
         )
         ws.note = f"on-chain only, balance=${sub.usdc_balance:.0f}, positions={n_pos}"
-
         return ws
 
     def _enrich_with_indexer(self, ws: WalletScore) -> None:
-        """
-        Enrichir un wallet avec ses fills historiques (Indexer REST).
-        Met à jour ws.total_score en place.
-        """
         try:
             fills_raw = self.rest.paginate_fills(
                 address=ws.address,
@@ -242,14 +219,13 @@ class DydxWalletDiscovery:
                 max_pages=5,
                 page_size=100,
             )
-
             if len(fills_raw) < 5:
                 ws.note += " | indexer_fills_insufficient"
                 return
 
-            # Calcul PnL simplifié depuis fills (même logique que backtest.py)
             pnl_total, fees_total, wins, total = 0.0, 0.0, 0, 0
-            open_pos: dict[str, dict] = {}
+            open_pos: dict = {}
+            _closed_records: list[TradeRecord] = []  # pour compute_account_score
 
             for raw in sorted(fills_raw, key=lambda x: x.get("createdAt", "")):
                 side = raw.get("side", "")
@@ -261,14 +237,22 @@ class DydxWalletDiscovery:
                 except (ValueError, TypeError):
                     continue
 
-                key = f"{market}"
+                key = market
                 if key not in open_pos:
                     if market in BLOCKED_MARKETS:
                         continue
+                    entry_ts_raw = raw.get("createdAt", "")
+                    try:
+                        import datetime as _dt
+                        _ets = int(_dt.datetime.fromisoformat(
+                            entry_ts_raw.replace("Z", "+00:00")
+                        ).timestamp() * 1000) if entry_ts_raw else 0
+                    except Exception:
+                        _ets = 0
                     open_pos[key] = {
                         "side": "LONG" if side == "BUY" else "SHORT",
-                        "entry_price": price, "size": size,
-                        "entry_fee": fee,
+                        "entry_price": price, "size": size, "entry_fee": fee,
+                        "entry_ts": _ets,
                     }
                 else:
                     pos = open_pos[key]
@@ -277,14 +261,12 @@ class DydxWalletDiscovery:
                         (pos["side"] == "SHORT" and side == "BUY")
                     )
                     if not is_close:
-                        # ADD
                         total_notional = pos["size"] * pos["entry_price"] + size * price
                         total_size = pos["size"] + size
                         pos["entry_price"] = total_notional / total_size if total_size > 0 else pos["entry_price"]
                         pos["size"] = total_size
                         pos["entry_fee"] += fee
                     else:
-                        # CLOSE
                         gross = (
                             (price - pos["entry_price"]) * pos["size"]
                             if pos["side"] == "LONG"
@@ -296,30 +278,69 @@ class DydxWalletDiscovery:
                         total += 1
                         if net > 0:
                             wins += 1
+                        # Construire TradeRecord pour scoring
+                        try:
+                            entry_ts_ms = int(pos.get("entry_ts", 0))
+                            close_ts_raw = raw.get("createdAt", "")
+                            import datetime as _dt
+                            if close_ts_raw:
+                                close_ts_ms = int(_dt.datetime.fromisoformat(
+                                    close_ts_raw.replace("Z", "+00:00")
+                                ).timestamp() * 1000)
+                            else:
+                                close_ts_ms = entry_ts_ms + 60_000
+                            hold_ms = max(1000.0, float(close_ts_ms - entry_ts_ms))
+                            _closed_records.append(TradeRecord(
+                                pnl_gross=abs(gross),
+                                pnl_net=net,
+                                fees=pos["entry_fee"] + fee,
+                                size=pos["size"] * price,
+                                entry_price=pos["entry_price"],
+                                closed_at_ms=close_ts_ms,
+                                holding_time_ms=hold_ms,
+                                market_id=market,
+                            ))
+                        except Exception:
+                            pass
                         del open_pos[key]
 
             if total >= 3:
-                ws.net_pnl_usdc = pnl_total
-                ws.trade_count = total
-                ws.winrate = wins / total if total > 0 else 0.0
-
-                # Profit factor
-                gross_wins = sum(1 for _ in range(wins))  # simplified
-                ws.profit_factor = max(0.0, (pnl_total + fees_total) / max(fees_total, 0.01))
-
-                # Bonus PnL positif
-                pnl_bonus = min(0.3, max(-0.1, pnl_total / max(abs(pnl_total) + fees_total, 1.0)))
-
-                # Re-score total avec données Indexer
-                ws.total_score = (
-                    0.25 * ws.balance_score +
-                    0.35 * ws.market_priority_score +
-                    0.20 * ws.position_count_score +
-                    0.20 * (ws.winrate - 0.3) / 0.4 +  # normalised around 0.3-0.7
-                    pnl_bonus
+                # ── Viral bot: compute_account_score avec one-big-win filter ──
+                account_score = compute_account_score(
+                    account_address=ws.address,
+                    subaccount_number=ws.subaccount_number,
+                    network="mainnet",
+                    trades=_closed_records,
+                    current_ts_ms=int(time.time() * 1000),
                 )
-                ws.total_score = max(0.0, min(1.0, ws.total_score))
-                ws.note += f" | indexer: trades={total} winrate={ws.winrate:.0%} pnl={pnl_total:+.2f}"
+
+                if account_score.is_rejected:
+                    reasons = "; ".join(account_score.rejection_reasons[:2])
+                    ws.note += f" | REJECTED: {reasons}"
+                    ws.total_score = 0.0
+                    return
+
+                ws.net_pnl_usdc = account_score.total_pnl_net
+                ws.trade_count = account_score.total_trades
+                ws.winrate = account_score.winrate
+                ws.profit_factor = account_score.profit_factor
+                data_conf = account_score.data_confidence
+                pnl_bonus = min(0.3, max(-0.1,
+                    account_score.expectancy / max(abs(account_score.expectancy) + 1, 1.0)
+                ))
+                ws.total_score = max(0.0, min(1.0,
+                    0.25 * ws.balance_score +
+                    0.30 * ws.market_priority_score +
+                    0.20 * ws.position_count_score +
+                    0.15 * (ws.winrate - 0.3) / 0.4 +
+                    0.10 * data_conf +
+                    pnl_bonus
+                ))
+                ws.note += (
+                    f" | scored: trades={total} wr={ws.winrate:.0%}"
+                    f" pf={ws.profit_factor:.2f} pnl={ws.net_pnl_usdc:+.2f}"
+                    f" dd={account_score.max_drawdown:.2f}"
+                )
 
         except RestError as e:
             logger.debug("Indexer enrichment error %s: %s", ws.address, e)
@@ -328,18 +349,5 @@ class DydxWalletDiscovery:
 
 
 def build_seed_shortlist() -> list[WalletScore]:
-    """
-    Shortlist initiale de wallets connus actifs sur dYdX v4.
-    Sert d'amorçage avant la découverte automatique.
-
-    Note: Ces adresses sont issues du scan Cosmos LCD public.
-    Aucune donnée privée. READ-ONLY.
-    """
-    # Adresses découvertes lors du scan initial (juin 2026)
-    # Priorité: wallets avec positions sur ETH-USD/BTC-USD et large balance
-    SEED_ADDRESSES = [
-        # Placeholders - remplacés dynamiquement par discover_top_wallets()
-        # Format: (address, note)
-    ]
-    # Le système remplace cette liste au démarrage via discover_top_wallets()
+    """Shortlist initiale vide — remplacée au démarrage par fast_discover()."""
     return []

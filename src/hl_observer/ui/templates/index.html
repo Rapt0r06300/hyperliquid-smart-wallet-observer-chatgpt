@@ -48,6 +48,7 @@
             <div class="simulation-metric"><span>Wallets suivis</span><strong id="dydxWallets">0</strong></div>
           </div>
           <div id="dydxPositionsList" style="margin-top:8px;font-size:12px;opacity:.85"></div>
+          <div id="dydxNoTradePanel" style="margin-top:6px;font-size:11px;opacity:.7"></div>
           <div style="margin-top:6px;font-size:11px;opacity:.5">dYdX v4 Indexer REST — READ-ONLY — PAPER ONLY — 0 ordre reel</div>
         </div>
         <p class="section-help">
@@ -394,9 +395,25 @@
 
           // Badge engine
           if (badge) {
-            badge.textContent = status.running ? "LIVE" : "ARRETE";
-            badge.style.background = status.running ? "#00ffb4" : "#ff4444";
-            badge.style.color = status.running ? "#000" : "#fff";
+            var isDiscovering = (status.last_error === "DISCOVERY_RUNNING");
+            var noWallets = status.running && (status.wallets_in_shortlist === 0) && !isDiscovering;
+            if (isDiscovering) {
+              badge.textContent = "SCAN WALLETS...";
+              badge.style.background = "#f5a623";
+              badge.style.color = "#000";
+            } else if (status.running && status.wallets_in_shortlist > 0) {
+              badge.textContent = "LIVE • " + status.wallets_in_shortlist + " wallets";
+              badge.style.background = "#00ffb4";
+              badge.style.color = "#000";
+            } else if (status.running) {
+              badge.textContent = "DEMARRAGE...";
+              badge.style.background = "#f5a623";
+              badge.style.color = "#000";
+            } else {
+              badge.textContent = "ARRETE";
+              badge.style.background = "#ff4444";
+              badge.style.color = "#fff";
+            }
           }
 
           // Métriques PnL
@@ -435,12 +452,28 @@
               ["Equity dYdX", fmtUsd(eq) + " USDT"],
               ["Trades fermes", String(status.total_trades || 0)],
               ["Winrate", status.winrate || "0%"],
-              ["Positions ouvertes", String((positions||[]).length)],
+              ["Leader exits", String(status.leader_exits || 0)],
+              ["Refus signaux", String(status.signals_refused || 0)],
               ["Wallets scores", String((wallets||[]).length)]
             ];
             summary.innerHTML = metrics.map(function(m) {
               return "<div class=\"simulation-metric\"><span>" + m[0] + "</span><strong>" + m[1] + "</strong></div>";
             }).join("");
+          }
+
+          // No-trade reasons breakdown (viral bot: log refus autant que entrées)
+          var ntPanel = document.getElementById("dydxNoTradePanel");
+          if (ntPanel && status.no_trade_reasons) {
+            var entries = Object.entries(status.no_trade_reasons || {});
+            if (entries.length > 0) {
+              entries.sort(function(a,b){return b[1]-a[1];});
+              ntPanel.innerHTML = "<span style=\"opacity:.5\">NO_TRADE: </span>" +
+                entries.slice(0,5).map(function(r){
+                  return "<span style=\"margin-right:8px\">" + r[0] + ":<b>" + r[1] + "</b></span>";
+                }).join("");
+            } else {
+              ntPanel.innerHTML = "";
+            }
           }
 
         } catch(e) {

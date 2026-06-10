@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -37,6 +38,7 @@ from hyper_smart_observer.dydx_v4.models import (
 )
 from hyper_smart_observer.dydx_v4.rest_client import DydxIndexerRestClient, RestError
 from hyper_smart_observer.dydx_v4.safety import assert_paper_only
+from hyper_smart_observer.dydx_v4.edge_calculator import calculate_edge, MIN_EDGE_BPS
 from hyper_smart_observer.dydx_v4.wallet_discovery import DydxWalletDiscovery, WalletScore
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,10 @@ POLL_INTERVAL_S = 5.0
 
 # Découverte shortlist: refresh toutes les 6 heures
 DISCOVERY_REFRESH_S = 6 * 3600
+
+# Timeout force-close: position perdante sans signal frais > N secondes → clôture préventive
+# Empêche les pertes non surveillées quand le flux de signaux tarit
+STALE_POSITION_TIMEOUT_S = 180.0
 
 # Marchés prioritaires (ETH en premier d'après l'analyse)
 FOCUS_MARKETS = ["ETH-USD", "BTC-USD", "SOL-USD"]
@@ -98,14 +104,26 @@ class PaperPositionState:
 
     def calculate_pnl(self, mark_price: float) -> float:
         """
-        PnL non réalisé.
-        LONG: (mark - entry) * size / entry
-        SHORT: (entry - mark) * size / entry
+        PnL réalisé en USDT.
+        size = notionnel USDT (ex: 50.0).
+        LONG: (mark - entry) / entry * size_usdt
+        SHORT: (entry - mark) / entry * size_usdt
         """
+        if self.entry_price <= 0:
+            return 0.0
         if self.side == "LONG":
             return (mark_price - self.entry_price) / self.entry_price * self.size
         else:
             return (self.entry_price - mark_price) / self.entry_price * self.size
+
+    def unrealized_pnl_pct(self, mark_price: float) -> float:
+        """PnL non réalisé en % de la taille notionnelle."""
+        if self.entry_price <= 0:
+            return 0.0
+        if self.side == "LONG":
+            return (mark_price - self.entry_price) / self.entry_price * 100.0
+        else:
+            return (self.entry_price - mark_price) / self.entry_price * 100.0
 
     def is_stop_loss_hit(self, mark_price: float) -> bool:
         if self.side == "LONG":
@@ -167,6 +185,8 @@ class ObserverStats:
             "fees_paid": round(self.total_fees_paid, 4),
             "signals_refused": self.signals_refused,
             "stale_refused": self.stale_signals_refused,
+            "stop_loss_exits": self.stop_loss_exits,
+            "take_profit_exits": self.take_profit_exits,
             "disclaimer": self.disclaimer,
         }
 
@@ -176,17 +196,18 @@ class DydxLiveObserver:
     Observateur paper trading dYdX v4.
 
     Architecture:
-    1. Discovery: Cosmos LCD → shortlist des meilleurs wallets
+    1. Discovery: Cosmos LCD → shortlist des meilleurs wallets (background, non-bloquant)
     2. Poll REST toutes les 5s pour chaque wallet shortlisté
     3. Cluster detector: détecte 2+ wallets même direction dans 60s
     4. Paper entry: si cluster frais + marché prioritaire + pas max_open
-    5. Paper exit: stop-loss (-1.5%), take-profit (+2.5%), ou sortie leader
+    5. Paper exit: stop-loss (-1.5%), take-profit (+2.5%), ou timeout stale signal
 
     RÉGLAGES EMPIRIQUES:
     - ETH-USD en priorité (signal age 3s prouvé dans HL)
     - Stop-loss OBLIGATOIRE (HYPE sans stop = -$20)
     - Poll 5s au lieu de 47s (résout 47% NO_MATCHING)
     - 2 wallets min (pas 5+, contre-productif d'après l'analyse)
+    - Stale position timeout 180s: ferme les positions perdantes sans signal frais
 
     PAPER-ONLY. AUCUN ORDRE RÉEL. AUCUNE CLÉ PRIVÉE.
     """
@@ -238,8 +259,17 @@ class DydxLiveObserver:
 
         # Cache prix oracle
         self._mark_prices: dict[str, float] = {}
-        self._last_discovery_ms: int = 0
+        # Initialiser à "maintenant" pour éviter le run de découverte synchrone
+        # au 1er tour — la découverte démarre en background dans run()
+        self._last_discovery_ms: int = int(time.time() * 1000)
         self._running: bool = False
+        # Flag background discovery en cours
+        self._discovery_running: bool = False
+        # Job B viral bot: snapshots des positions par wallet → détection CLOSE
+        # {wallet_key: {pos_key: {market, side, size, entry_price}}}
+        self._position_snapshots: dict[str, dict] = {}
+        # Journal des NO_TRADE par raison (viral bot: "afficher les refus autant que les entrées")
+        self._no_trade_reasons: dict[str, int] = {}
 
     # ─────────────────────────────────────────────
     # Boucle principale (REST polling)
@@ -269,6 +299,10 @@ class DydxLiveObserver:
             self.stats.session_id, self.config.mode.value, self.DISCLAIMER
         )
 
+        # Lancer la découverte en arrière-plan dès le démarrage (non-bloquant)
+        if self.discovery:
+            self._start_background_discovery()
+
         try:
             while self._running:
                 if max_iterations and iteration >= max_iterations:
@@ -277,12 +311,13 @@ class DydxLiveObserver:
                 iteration += 1
                 now_ms = int(time.time() * 1000)
 
-                # 1. Refresh shortlist si nécessaire
+                # 1. Refresh shortlist si nécessaire (refresh périodique après init)
                 if (
                     self.discovery
+                    and not self._discovery_running
                     and now_ms - self._last_discovery_ms > discovery_refresh_s * 1000
                 ):
-                    self._refresh_shortlist()
+                    self._start_background_discovery()
                     self._last_discovery_ms = now_ms
 
                 # 2. Mettre à jour prix oracle
@@ -290,6 +325,9 @@ class DydxLiveObserver:
 
                 # 3. Vérifier stop-loss / take-profit sur positions ouvertes
                 self._check_exits()
+
+                # 3b. Fermer les positions sans signal frais depuis trop longtemps
+                self._check_stale_positions()
 
                 # 4. Poller les wallets shortlistés
                 self._poll_shortlist()
@@ -304,12 +342,15 @@ class DydxLiveObserver:
                 # 7. Log de statut
                 if iteration % 12 == 0:  # toutes les ~60s
                     logger.info(
-                        "Observer status: equity=%.4f pnl=%+.4f positions=%d/%d signals_refused=%d",
+                        "Observer status: equity=%.4f pnl=%+.4f positions=%d/%d "
+                        "shortlist=%d signals_refused=%d discovery=%s",
                         self.stats.equity,
                         self.stats.total_net_pnl_usdc,
                         len(self._open_positions),
                         MAX_OPEN_PAPER_POSITIONS,
+                        len(self._shortlist),
                         self.stats.signals_refused,
+                        "running" if self._discovery_running else "idle",
                     )
 
                 time.sleep(self.poll_interval_s)
@@ -332,16 +373,80 @@ class DydxLiveObserver:
     # Refresh shortlist
     # ─────────────────────────────────────────────
 
-    def _refresh_shortlist(self) -> None:
-        """Refresh la shortlist via wallet discovery."""
-        if not self.discovery:
+    def _start_background_discovery(self) -> None:
+        """Lancer la découverte de wallets dans un thread daemon (non-bloquant)."""
+        if self._discovery_running:
+            logger.debug("Discovery déjà en cours, skip")
             return
-        try:
-            result = self.discovery.discover_top_wallets(n=20)
-            self._shortlist = result.shortlisted
-            logger.info("Shortlist refreshed: %d wallets", len(self._shortlist))
-        except Exception as e:
-            logger.error("Discovery refresh error: %s", e)
+        self._discovery_running = True
+
+        def _do():
+            try:
+                logger.info("Background discovery START")
+                result = self.discovery.fast_discover(n=20)
+                self._shortlist = result.shortlisted
+                self._last_discovery_ms = int(time.time() * 1000)
+                logger.info(
+                    "Background discovery DONE: %d wallets en %.1fs",
+                    len(self._shortlist),
+                    (result.finished_at_ms - result.started_at_ms) / 1000,
+                )
+            except Exception as e:
+                logger.error("Background discovery error: %s", e)
+            finally:
+                self._discovery_running = False
+
+        t = threading.Thread(target=_do, name="dydx-discovery", daemon=True)
+        t.start()
+
+    def _refresh_shortlist(self) -> None:
+        """Refresh périodique (appelé par le timer 6h). Délègue au background thread."""
+        self._start_background_discovery()
+
+    def _check_stale_positions(self) -> None:
+        """
+        Fermer les positions paper si aucun signal frais depuis trop longtemps ET perte.
+
+        Logique: si une position est ouverte depuis > STALE_POSITION_TIMEOUT_S secondes
+        ET que la shortlist est vide (plus de wallets à suivre pour confirmer le signal)
+        ET que la position est actuellement en perte → clôture préventive.
+
+        Ceci évite de laisser des pertes s'accumuler quand le flux de données tarit.
+        """
+        if not self._open_positions:
+            return
+
+        now_ms = int(time.time() * 1000)
+        timeout_ms = STALE_POSITION_TIMEOUT_S * 1000
+        to_close: list[tuple[str, float]] = []
+
+        for pos_key, pos in self._open_positions.items():
+            age_ms = now_ms - pos.opened_at_ms
+            if age_ms < timeout_ms:
+                continue  # Position encore jeune, pas de timeout
+
+            mark_price = self._mark_prices.get(pos.market_id)
+            if not mark_price:
+                continue  # Pas de prix oracle, on ne ferme pas à l'aveugle
+
+            unrealized_pct = pos.unrealized_pnl_pct(mark_price)
+            shortlist_empty = len(self._shortlist) == 0
+
+            # Fermer si: timeout dépassé ET (shortlist vide OU perte > 0.5%)
+            if shortlist_empty and unrealized_pct < 0:
+                to_close.append((pos_key, mark_price))
+            elif unrealized_pct < -0.5:
+                # Perte > 0.5% avec position âgée → sortie avant stop-loss à -1.5%
+                to_close.append((pos_key, mark_price))
+
+        for pos_key, exit_price in to_close:
+            logger.info(
+                "STALE_TIMEOUT: Fermeture préventive position %s age=%.0fs",
+                pos_key,
+                (now_ms - self._open_positions[pos_key].opened_at_ms) / 1000
+                if pos_key in self._open_positions else 0,
+            )
+            self._close_paper_position(pos_key, exit_price, "STALE_SIGNAL_TIMEOUT")
 
     # ─────────────────────────────────────────────
     # Prix oracle
@@ -362,11 +467,45 @@ class DydxLiveObserver:
             logger.debug("Market price refresh error: %s", e)
 
     # ─────────────────────────────────────────────
+    # Accesseur d'état public
+    # ─────────────────────────────────────────────
+
+    def get_status(self) -> dict:
+        """Retourne un snapshot thread-safe de l'état courant."""
+        return {
+            "running": self._running,
+            "session_id": self.stats.session_id,
+            "mode": self.config.mode.value if hasattr(self.config.mode, "value") else str(self.config.mode),
+            "shortlist_size": len(self._shortlist),
+            "open_positions": len(self._open_positions),
+            "iteration": self.stats.total_signals_seen,
+            "net_pnl_usdc": round(self.stats.total_net_pnl_usdc, 4),
+            "equity": round(self.stats.equity, 4),
+            "total_trades": self.stats.positions_closed,
+            "winrate": self.stats.winrate,
+            "signals_refused": self.stats.signals_refused,
+            "stale_refused": self.stats.stale_signals_refused,
+            "fees_paid": round(self.stats.total_fees_paid, 4),
+            "discovery_running": self._discovery_running,
+            "no_trade_reasons": dict(
+                sorted(self._no_trade_reasons.items(), key=lambda x: -x[1])[:10]
+            ),
+            "leader_exits": sum(
+                1 for t in self._closed_trades if t.get("reason") == "LEADER_EXIT"
+            ),
+            "disclaimer": self.DISCLAIMER,
+        }
+
+    # ─────────────────────────────────────────────
     # Poll wallets shortlistés
     # ─────────────────────────────────────────────
 
     def _poll_shortlist(self) -> None:
-        """Poller les positions de chaque wallet shortlisté."""
+        """
+        Job B du viral bot: poller les positions de chaque wallet shortlisté.
+        Détecte les OPEN (nouveau cluster) et les CLOSE (position disparue).
+        Suit les sorties du leader (LEADER_EXIT).
+        """
         for wallet in self._shortlist:
             try:
                 resp = self.rest.get_positions(
@@ -376,6 +515,38 @@ class DydxLiveObserver:
                     limit=50,
                 )
                 positions = resp.get("positions", [])
+                wallet_key = f"{wallet.address}/{wallet.subaccount_number}"
+
+                # ── Snapshot actuel ─────────────────────────────────────────
+                current_snapshot: dict[str, dict] = {}
+                for pos in positions:
+                    market = pos.get("market", "")
+                    side = pos.get("side", "")
+                    if not market or not side:
+                        continue
+                    try:
+                        sz = float(pos.get("size", 0) or 0)
+                        ep = float(pos.get("entryPrice", 0) or 0)
+                    except (ValueError, TypeError):
+                        continue
+                    pk = f"{market}:{side}"
+                    current_snapshot[pk] = {
+                        "market": market, "side": side,
+                        "size": sz, "entry_price": ep,
+                    }
+
+                # ── Détection CLOSE: position présente avant, disparue maintenant ──
+                prev_snapshot = self._position_snapshots.get(wallet_key, {})
+                for pk, prev_pos in prev_snapshot.items():
+                    if pk not in current_snapshot:
+                        self._handle_leader_close(
+                            prev_pos["market"], prev_pos["side"], wallet.address
+                        )
+
+                # Sauvegarder le nouveau snapshot
+                self._position_snapshots[wallet_key] = current_snapshot
+
+                # ── Cluster detector (détection OPEN) ─────────────────────
                 events = self.cluster.update_positions(
                     address=wallet.address,
                     positions_raw=positions,
@@ -390,6 +561,36 @@ class DydxLiveObserver:
                     logger.debug("Poll error %s: %s", wallet.address[:12], e)
             except Exception as e:
                 logger.debug("Poll error %s: %s", wallet.address[:12], e)
+
+    def _handle_leader_close(self, market: str, side: str, leader_addr: str) -> None:
+        """
+        Fermer le paper trade correspondant quand un leader clôture sa position.
+
+        C'est le mécanisme SELL du viral bot (Job B): quand la position
+        disparaît du snapshot → fermer notre paper trade au prix oracle.
+
+        PAPER-ONLY. Aucun ordre réel.
+        """
+        pos_key = f"{market}:{side}"
+        if pos_key not in self._open_positions:
+            return
+
+        mark_price = self._mark_prices.get(market)
+        if not mark_price or mark_price <= 0:
+            return
+
+        pos = self._open_positions[pos_key]
+        # Attendre au moins 5s pour éviter les faux positifs (snapshot race)
+        age_ms = int(time.time() * 1000) - pos.opened_at_ms
+        if age_ms < 5_000:
+            logger.debug("LEADER_EXIT skip (position trop récente %dms): %s", age_ms, pos_key)
+            return
+
+        logger.info(
+            "LEADER_EXIT: %s %s fermé par %s → paper close @ %.4f | PAPER-ONLY",
+            side, market, leader_addr[:12], mark_price,
+        )
+        self._close_paper_position(pos_key, mark_price, "LEADER_EXIT")
 
     # ─────────────────────────────────────────────
     # Évaluation cluster → signal paper
@@ -443,6 +644,49 @@ class DydxLiveObserver:
             self._refuse(f"NO_ORACLE_PRICE {market}")
             return
 
+        # Gate 7: Edge net positif après coûts (viral bot edge formula)
+        # leader_winrate/pf depuis wallet scores si disponibles
+        avg_wr = 0.0
+        avg_pf = 0.0
+        avg_exp = 0.0
+        n_sc = 0
+        for ws in self._shortlist:
+            if hasattr(ws, "winrate") and ws.winrate > 0:
+                avg_wr += ws.winrate
+                avg_pf += getattr(ws, "profit_factor", 1.0)
+                avg_exp += getattr(ws, "net_pnl_usdc", 0.0) / max(1, getattr(ws, "trade_count", 1))
+                n_sc += 1
+        if n_sc > 0:
+            avg_wr /= n_sc
+            avg_pf /= n_sc
+            avg_exp /= n_sc
+        else:
+            # Aucune donnée de track record disponible → gate edge skippée
+            # Le edge calculé sans historique est trop conservateur et rejetterait
+            # tous les signaux de wallets nouvellement découverts. On se fie aux
+            # autres gates (fraîcheur, cluster, marché prioritaire, prix).
+            n_sc = -1  # sentinel: skip edge gate
+
+        if n_sc >= 0:
+            # Track record disponible → appliquer la formule complète du viral bot
+            delay_ms = max(0, int(time.time() * 1000) - cluster.last_wallet_opened_ms)
+            edge = calculate_edge(
+                signal_age_ms=cluster.signal_age_ms,
+                wallet_count=cluster.wallet_count,
+                leader_winrate=avg_wr,
+                leader_profit_factor=avg_pf,
+                leader_expectancy_usdc=avg_exp,
+                paper_notional_usdc=PAPER_NOTIONAL_USDT,
+                spread_bps=3.0,
+                slippage_bps=1.0,
+                fee_bps=10.0,
+                delay_ms=delay_ms,
+                min_edge_bps=MIN_EDGE_BPS,
+            )
+            if not edge.accepted:
+                self._refuse(f"EDGE_INSUFFICIENT ({edge.reject_reason})")
+                return
+
         # Calcul stop-loss / take-profit
         sl_factor = self.stop_loss_pct / 100.0
         tp_factor = self.take_profit_pct / 100.0
@@ -456,7 +700,7 @@ class DydxLiveObserver:
 
         # Calcul frais
         fee = PAPER_NOTIONAL_USDT * (TAKER_FEE_BPS / 10_000)
-        size_in_units = PAPER_NOTIONAL_USDT / mark_price
+        size_notional = PAPER_NOTIONAL_USDT  # en USDT fictifs (pas en unités d'actif)
 
         # Ouvrir position paper
         position_id = hashlib.sha256(
@@ -467,7 +711,7 @@ class DydxLiveObserver:
             position_id=position_id,
             market_id=market,
             side=cluster.side,
-            size=PAPER_NOTIONAL_USDT,
+            size=size_notional,
             entry_price=mark_price,
             stop_loss_price=stop_price,
             take_profit_price=tp_price,
@@ -475,18 +719,24 @@ class DydxLiveObserver:
             cluster_id=cluster.cluster_id,
             wallet_count=cluster.wallet_count,
             fee_paid=fee,
-            simulation_mode=SimulationMode(self.config.mode.value),
+            simulation_mode=self.config.mode,
         )
 
         self._open_positions[pos_key] = pos
         self.stats.positions_opened += 1
         self.stats.signals_accepted += 1
         self.stats.total_fees_paid += fee
+        self.stats.total_net_pnl_usdc -= fee  # Frais d'entrée déduits immédiatement
+
+        markets_key = f"{market}:{cluster.side}"
+        self.stats.markets_traded[markets_key] = (
+            self.stats.markets_traded.get(markets_key, 0) + 1
+        )
 
         logger.info(
-            "PAPER OPEN: %s %s entry=%.4f sl=%.4f tp=%.4f wallets=%d age=%dms cluster=%s",
-            market, cluster.side, mark_price, stop_price, tp_price,
-            cluster.wallet_count, cluster.signal_age_ms, cluster.cluster_id,
+            "PAPER OPEN %s %s @ %.4f SL=%.4f TP=%.4f wallets=%d cluster=%s | PAPER-ONLY",
+            cluster.side, market, mark_price, stop_price, tp_price,
+            cluster.wallet_count, cluster.cluster_id[:8],
         )
 
     # ─────────────────────────────────────────────
@@ -495,42 +745,33 @@ class DydxLiveObserver:
 
     def _check_exits(self) -> None:
         """Vérifier stop-loss et take-profit sur toutes les positions ouvertes."""
-        to_close: list[tuple[str, str, float]] = []  # (pos_key, reason, exit_price)
+        to_close: list[tuple[str, float, str]] = []
 
         for pos_key, pos in self._open_positions.items():
             mark_price = self._mark_prices.get(pos.market_id)
             if not mark_price:
                 continue
-
             if pos.is_stop_loss_hit(mark_price):
-                to_close.append((pos_key, "STOP_LOSS", mark_price))
+                to_close.append((pos_key, mark_price, "STOP_LOSS"))
             elif pos.is_take_profit_hit(mark_price):
-                to_close.append((pos_key, "TAKE_PROFIT", mark_price))
+                to_close.append((pos_key, mark_price, "TAKE_PROFIT"))
 
-        for pos_key, reason, exit_price in to_close:
+        for pos_key, exit_price, reason in to_close:
             self._close_paper_position(pos_key, exit_price, reason)
 
-    def _close_paper_position(
-        self,
-        pos_key: str,
-        exit_price: float,
-        reason: str,
-    ) -> Optional[dict]:
-        """Fermer une position paper et enregistrer le trade."""
+    def _close_paper_position(self, pos_key: str, exit_price: float, reason: str) -> None:
+        """Clôturer une position paper et mettre à jour les stats."""
         pos = self._open_positions.pop(pos_key, None)
         if not pos:
-            self.stats.no_matching_refused += 1
-            return None
+            return
 
-        # Calcul PnL
         gross_pnl = pos.calculate_pnl(exit_price)
-        exit_fee = pos.size * (TAKER_FEE_BPS / 10_000)
+        exit_fee = PAPER_NOTIONAL_USDT * (TAKER_FEE_BPS / 10_000)
         net_pnl = gross_pnl - exit_fee
 
-        # Mise à jour stats
-        self.stats.positions_closed += 1
         self.stats.total_net_pnl_usdc += net_pnl
         self.stats.total_fees_paid += exit_fee
+        self.stats.positions_closed += 1
 
         if net_pnl > 0:
             self.stats.winning_trades += 1
@@ -542,74 +783,39 @@ class DydxLiveObserver:
         elif reason == "TAKE_PROFIT":
             self.stats.take_profit_exits += 1
 
-        market = pos.market_id
-        self.stats.markets_traded[market] = (
-            self.stats.markets_traded.get(market, 0) + net_pnl
-        )
-
-        trade = {
+        trade_record = {
             "position_id": pos.position_id,
-            "market_id": market,
+            "market_id": pos.market_id,
             "side": pos.side,
-            "entry_price": pos.entry_price,
-            "exit_price": exit_price,
-            "size_usdt": pos.size,
-            "gross_pnl": round(gross_pnl, 6),
-            "net_pnl": round(net_pnl, 6),
-            "total_fees": round(pos.fee_paid + exit_fee, 6),
+            "entry_price": round(pos.entry_price, 6),
+            "exit_price": round(exit_price, 6),
+            "size": round(pos.size, 6),
+            "gross_pnl": round(gross_pnl, 4),
+            "fees": round(pos.fee_paid + exit_fee, 4),
+            "net_pnl": round(net_pnl, 4),
             "reason": reason,
+            "opened_at_ms": pos.opened_at_ms,
+            "closed_at_ms": int(time.time() * 1000),
             "wallet_count": pos.wallet_count,
-            "duration_ms": int(time.time() * 1000) - pos.opened_at_ms,
-            "simulation_mode": pos.simulation_mode.value,
-            "disclaimer": "PAPER ONLY. No real order.",
+            "cluster_id": pos.cluster_id,
+            "disclaimer": "PAPER TRADE ONLY",
         }
-        self._closed_trades.append(trade)
+        self._closed_trades.append(trade_record)
 
         logger.info(
-            "PAPER CLOSE: %s %s reason=%s entry=%.4f exit=%.4f net_pnl=%+.4f equity=%.4f",
-            market, pos.side, reason, pos.entry_price, exit_price, net_pnl, self.stats.equity,
+            "PAPER CLOSE %s %s entry=%.4f exit=%.4f net_pnl=%+.4f reason=%s | PAPER-ONLY",
+            pos.side, pos.market_id, pos.entry_price, exit_price, net_pnl, reason,
         )
 
-        return trade
-
-    # ─────────────────────────────────────────────
-    # Utilitaires
-    # ─────────────────────────────────────────────
-
     def _refuse(self, reason: str) -> None:
+        """Enregistrer un refus de signal (viral bot: log autant les refus que les entrées)."""
         self.stats.signals_refused += 1
-        logger.debug("Signal refused: %s", reason)
-
-    def get_status(self) -> dict:
-        """Statut complet de la session paper trading."""
-        assert_paper_only(self.config)
-        open_pos = []
-        for pk, pos in self._open_positions.items():
-            mark = self._mark_prices.get(pos.market_id, pos.entry_price)
-            unrealized = pos.calculate_pnl(mark)
-            open_pos.append({
-                "market_id": pos.market_id,
-                "side": pos.side,
-                "entry_price": pos.entry_price,
-                "mark_price": mark,
-                "unrealized_pnl": round(unrealized, 4),
-                "stop_loss": pos.stop_loss_price,
-                "take_profit": pos.take_profit_price,
-                "wallet_count": pos.wallet_count,
-                "simulation_mode": pos.simulation_mode.value,
-            })
-
-        return {
-            **self.stats.to_summary(),
-            "open_positions": open_pos,
-            "shortlist_size": len(self._shortlist),
-            "mark_prices": {k: v for k, v in self._mark_prices.items() if k in self.focus_markets},
-        }
-
-    def get_closed_trades(self) -> list[dict]:
-        """Historique des trades fermés (paper uniquement)."""
-        return list(self._closed_trades)
+        # Extraire la raison principale pour les stats
+        reason_key = reason.split(" ")[0].rstrip("(").split("(")[0]
+        self._no_trade_reasons[reason_key] = self._no_trade_reasons.get(reason_key, 0) + 1
+        logger.debug("NO_TRADE: %s", reason)
 
     def stop(self) -> None:
-        """Arrêter la boucle."""
+        """Arrêter l'observateur proprement."""
         self._running = False
+        logger.info("DydxLiveObserver stop requested | %s", self.DISCLAIMER)
