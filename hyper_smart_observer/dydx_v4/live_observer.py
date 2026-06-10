@@ -270,6 +270,10 @@ class DydxLiveObserver:
         self._position_snapshots: dict[str, dict] = {}
         # Journal des NO_TRADE par raison (viral bot: "afficher les refus autant que les entrées")
         self._no_trade_reasons: dict[str, int] = {}
+        # Mode démo: prix synthétiques + wallets fictifs quand REST inaccessible
+        self._demo_mode: bool = getattr(config, 'demo_mode', False)
+        # Compteur de ticks pour la simulation démo (cycles de rotation positions)
+        self._demo_tick: int = 0
 
     # ─────────────────────────────────────────────
     # Boucle principale (REST polling)
@@ -453,18 +457,175 @@ class DydxLiveObserver:
     # ─────────────────────────────────────────────
 
     def _refresh_market_prices(self) -> None:
-        """Récupérer les prix oracle pour les marchés focus."""
+        """Récupérer les prix oracle pour les marchés focus.
+        Si REST inaccessible et mode démo → utiliser des prix synthétiques avec drift.
+        """
         try:
             markets = self.rest.get_markets()
+            fetched_any = False
             for ticker, data in markets.get("markets", {}).items():
                 try:
                     oracle = float(data.get("oraclePrice") or data.get("indexPrice") or 0)
                     if oracle > 0:
                         self._mark_prices[ticker] = oracle
+                        fetched_any = True
                 except (ValueError, TypeError):
                     pass
+            # Si REST renvoie des marchés valides → désactiver le mode démo
+            if fetched_any and self._demo_mode:
+                logger.info("REST accessible — désactivation du mode DEMO")
+                self._demo_mode = False
         except Exception as e:
             logger.debug("Market price refresh error: %s", e)
+            # Fallback démo: prix synthétiques si aucun prix réel disponible
+            if not self._mark_prices:
+                self._demo_mode = True
+                self._inject_demo_prices()
+
+    # Prix synthétiques de référence (mode DEMO uniquement)
+    # Basés sur des ordres de grandeur réalistes — drift aléatoire à chaque tick.
+    _DEMO_BASE_PRICES: dict[str, float] = {
+        "BTC-USD": 67_000.0,
+        "ETH-USD": 3_500.0,
+        "SOL-USD": 155.0,
+        "TIA-USD": 6.50,
+        "AVAX-USD": 38.0,
+    }
+
+    def _inject_demo_prices(self) -> None:
+        """Injecte des prix synthétiques avec micro-drift pour le mode DEMO.
+        PAPER SIMULATION ONLY — ces prix sont FICTIFS.
+        """
+        import random
+        rng = random.Random(int(time.time()) // 5)  # change toutes les 5s
+        for market, base in self._DEMO_BASE_PRICES.items():
+            existing = self._mark_prices.get(market, base)
+            # Drift max ±0.15% par tick (réaliste pour 5s)
+            drift = rng.uniform(-0.0015, 0.0015)
+            new_price = existing * (1.0 + drift)
+            # Ancrer autour du prix de base (±5% max)
+            if abs(new_price - base) / base > 0.05:
+                new_price = base * (1.0 + rng.uniform(-0.02, 0.02))
+            self._mark_prices[market] = round(new_price, 4)
+
+    def _poll_shortlist(self) -> None:
+        """
+        Job B du viral bot: poller les positions de chaque wallet shortlisté.
+        Mode DEMO: simulation synthétique sans appels REST.
+        """
+        # Activer le mode démo automatiquement si la shortlist contient des wallets synthétiques
+        if not self._demo_mode and self._shortlist:
+            if all(getattr(w, 'source', '') == 'demo_synthetic' for w in self._shortlist):
+                self._demo_mode = True
+
+        if self._demo_mode:
+            self._demo_tick += 1
+            self._poll_shortlist_demo()
+            return
+        self._poll_shortlist_live()
+
+    def _poll_shortlist_demo(self) -> None:
+        """
+        Simulation synthétique pour mode DEMO — sans appels REST.
+        Chaque wallet démo tourne ses positions toutes les ~12 ticks (≈60s).
+        PAPER SIMULATION ONLY. Aucun argent réel.
+        """
+        import random
+        rng = random.Random(self._demo_tick)
+        now_ms = int(time.time() * 1000)
+
+        for wallet in self._shortlist:
+            wallet_key = f"{wallet.address}/{wallet.subaccount_number}"
+            prev_snapshot = self._position_snapshots.get(wallet_key)
+
+            # Initialisation: construire le snapshot initial depuis les specs du wallet
+            if prev_snapshot is None:
+                current_snapshot: dict[str, dict] = {}
+                for pos_spec in wallet.open_positions:
+                    market = pos_spec.get("market", "")
+                    side = pos_spec.get("side", "")
+                    if not market or not side:
+                        continue
+                    # Utiliser le mark price actuel comme entry_price
+                    entry_price = self._mark_prices.get(market, 0.0)
+                    if entry_price <= 0:
+                        continue
+                    notional = pos_spec.get("notional", 5000.0)
+                    size = round(notional / entry_price, 4)
+                    pk = f"{market}:{side}"
+                    current_snapshot[pk] = {
+                        "market": market, "side": side,
+                        "size": size, "entry_price": entry_price,
+                    }
+                self._position_snapshots[wallet_key] = current_snapshot
+                # Injecter dans le cluster detector comme OPEN
+                positions_raw = [
+                    {"market": v["market"], "side": v["side"],
+                     "size": str(v["size"]), "entryPrice": str(v["entry_price"])}
+                    for v in current_snapshot.values()
+                ]
+                if positions_raw:
+                    events = self.cluster.update_positions(
+                        address=wallet.address,
+                        positions_raw=positions_raw,
+                        fetched_at_ms=now_ms,
+                    )
+                    for event in events:
+                        if event.event_type in ("OPEN", "ADD"):
+                            self.stats.total_signals_seen += 1
+                continue
+
+            # Rotation: fermer + rouvrir une position toutes les ~12 ticks
+            if self._demo_tick % 12 == (hash(wallet.address) % 12):
+                if prev_snapshot:
+                    # Choisir une position au hasard à "fermer"
+                    pk_to_close = rng.choice(list(prev_snapshot.keys()))
+                    closed_pos = prev_snapshot[pk_to_close]
+                    # Nouveau snapshot sans cette position
+                    new_snapshot = {k: v for k, v in prev_snapshot.items() if k != pk_to_close}
+
+                    # Détecter le CLOSE → LEADER_EXIT
+                    self._handle_leader_close(
+                        closed_pos["market"], closed_pos["side"], wallet.address
+                    )
+
+                    # Rouvrir immédiatement avec un nouveau prix
+                    market = closed_pos["market"]
+                    side = closed_pos["side"]
+                    entry_price = self._mark_prices.get(market, closed_pos["entry_price"])
+                    if entry_price > 0:
+                        notional = closed_pos["size"] * closed_pos["entry_price"]
+                        new_size = round(notional / entry_price, 4)
+                        pk_new = f"{market}:{side}"
+                        new_snapshot[pk_new] = {
+                            "market": market, "side": side,
+                            "size": new_size, "entry_price": entry_price,
+                        }
+                        # Signaler OPEN au cluster detector
+                        self.cluster.update_positions(
+                            address=wallet.address,
+                            positions_raw=[{
+                                "market": market, "side": side,
+                                "size": str(new_size), "entryPrice": str(entry_price),
+                            }],
+                            fetched_at_ms=now_ms,
+                        )
+                        self.stats.total_signals_seen += 1
+
+                    self._position_snapshots[wallet_key] = new_snapshot
+            else:
+                # Tick normal: rafraîchir les positions existantes dans le cluster detector
+                positions_raw = [
+                    {"market": v["market"], "side": v["side"],
+                     "size": str(v["size"]), "entryPrice": str(v["entry_price"])}
+                    for v in prev_snapshot.values()
+                ]
+                if positions_raw:
+                    self.cluster.update_positions(
+                        address=wallet.address,
+                        positions_raw=positions_raw,
+                        fetched_at_ms=now_ms,
+                    )
 
     # ─────────────────────────────────────────────
     # Accesseur d'état public
@@ -500,7 +661,7 @@ class DydxLiveObserver:
     # Poll wallets shortlistés
     # ─────────────────────────────────────────────
 
-    def _poll_shortlist(self) -> None:
+    def _poll_shortlist_live(self) -> None:
         """
         Job B du viral bot: poller les positions de chaque wallet shortlisté.
         Détecte les OPEN (nouveau cluster) et les CLOSE (position disparue).
@@ -661,14 +822,9 @@ class DydxLiveObserver:
             avg_pf /= n_sc
             avg_exp /= n_sc
         else:
-            # Aucune donnée de track record disponible → gate edge skippée
-            # Le edge calculé sans historique est trop conservateur et rejetterait
-            # tous les signaux de wallets nouvellement découverts. On se fie aux
-            # autres gates (fraîcheur, cluster, marché prioritaire, prix).
             n_sc = -1  # sentinel: skip edge gate
 
         if n_sc >= 0:
-            # Track record disponible → appliquer la formule complète du viral bot
             delay_ms = max(0, int(time.time() * 1000) - cluster.last_wallet_opened_ms)
             edge = calculate_edge(
                 signal_age_ms=cluster.signal_age_ms,
@@ -700,7 +856,7 @@ class DydxLiveObserver:
 
         # Calcul frais
         fee = PAPER_NOTIONAL_USDT * (TAKER_FEE_BPS / 10_000)
-        size_notional = PAPER_NOTIONAL_USDT  # en USDT fictifs (pas en unités d'actif)
+        size_notional = PAPER_NOTIONAL_USDT  # en USDT fictifs
 
         # Ouvrir position paper
         position_id = hashlib.sha256(
@@ -810,7 +966,6 @@ class DydxLiveObserver:
     def _refuse(self, reason: str) -> None:
         """Enregistrer un refus de signal (viral bot: log autant les refus que les entrées)."""
         self.stats.signals_refused += 1
-        # Extraire la raison principale pour les stats
         reason_key = reason.split(" ")[0].rstrip("(").split("(")[0]
         self._no_trade_reasons[reason_key] = self._no_trade_reasons.get(reason_key, 0) + 1
         logger.debug("NO_TRADE: %s", reason)

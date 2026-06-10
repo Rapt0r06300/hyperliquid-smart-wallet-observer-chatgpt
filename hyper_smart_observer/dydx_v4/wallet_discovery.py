@@ -74,6 +74,75 @@ class DiscoveryResult:
     )
 
 
+# ---------------------------------------------------------------------------
+# Wallets synthétiques pour le mode démo (aucun réseau requis)
+# ---------------------------------------------------------------------------
+_DEMO_WALLET_SPECS = [
+    {
+        "address": "dydx1qjfsuqfpjqfsuqfpjqfsuqfpjqfsuqfpjfaa",
+        "label": "DEMO-ALPHA",
+        "markets": [
+            {"market": "ETH-USD", "side": "LONG", "notional": 15000},
+            {"market": "BTC-USD", "side": "LONG", "notional": 8000},
+        ],
+        "balance": 50000,
+        "winrate": 0.58,
+        "profit_factor": 1.72,
+        "score": 0.78,
+    },
+    {
+        "address": "dydx1rjfsuqfpjqfsuqfpjqfsuqfpjqfsuqfpjfbb",
+        "label": "DEMO-BETA",
+        "markets": [
+            {"market": "SOL-USD", "side": "LONG", "notional": 6000},
+            {"market": "ETH-USD", "side": "SHORT", "notional": 5000},
+        ],
+        "balance": 30000,
+        "winrate": 0.54,
+        "profit_factor": 1.45,
+        "score": 0.65,
+    },
+    {
+        "address": "dydx1sjfsuqfpjqfsuqfpjqfsuqfpjqfsuqfpjfcc",
+        "label": "DEMO-GAMMA",
+        "markets": [
+            {"market": "BTC-USD", "side": "SHORT", "notional": 20000},
+        ],
+        "balance": 80000,
+        "winrate": 0.61,
+        "profit_factor": 1.95,
+        "score": 0.82,
+    },
+]
+
+
+def _build_demo_wallets() -> list[WalletScore]:
+    """Construit des WalletScore synthétiques pour la simulation démo."""
+    result = []
+    for spec in _DEMO_WALLET_SPECS:
+        ws = WalletScore(
+            address=spec["address"],
+            subaccount_number=0,
+            usdc_balance=float(spec["balance"]),
+            open_positions=[
+                {"market": m["market"], "side": m["side"], "notional": m["notional"]}
+                for m in spec["markets"]
+            ],
+            balance_score=min(1.0, spec["balance"] / 100_000),
+            market_priority_score=0.8,
+            position_count_score=min(1.0, len(spec["markets"]) / 3),
+            total_score=spec["score"],
+            winrate=spec["winrate"],
+            profit_factor=spec["profit_factor"],
+            net_pnl_usdc=spec["balance"] * 0.12,  # ~12% PnL démo
+            trade_count=30,
+            note=f"[{spec['label']}] demo_synthetic",
+            source="demo_synthetic",
+        )
+        result.append(ws)
+    return result
+
+
 class DydxWalletDiscovery:
     """
     Découverte et scoring de wallets dYdX v4.
@@ -90,22 +159,53 @@ class DydxWalletDiscovery:
         rest_client: DydxIndexerRestClient,
         min_usdc_balance: float = 1_000.0,
         max_scan_pages: int = 10,
+        demo_mode: bool = False,
     ) -> None:
         self.cosmos = cosmos_client
         self.rest = rest_client
         self.min_usdc = min_usdc_balance
         self.max_scan_pages = max_scan_pages
+        self._demo_mode = demo_mode
 
     def fast_discover(self, n: int = 20) -> DiscoveryResult:
-        """Découverte rapide < 10s. Paper-only. Aucun ordre."""
+        """Découverte rapide < 10s. Paper-only. Aucun ordre.
+
+        Si demo_mode=True ou si Cosmos LCD renvoie 0 candidats,
+        injecte des wallets synthétiques pour que la simulation reste active.
+        """
         import hashlib
         started = int(time.time() * 1000)
         run_id = hashlib.sha256(f"fast:{started}".encode()).hexdigest()[:16]
-        logger.info("fast_discover START run_id=%s n=%d", run_id, n)
+        logger.info("fast_discover START run_id=%s n=%d demo=%s", run_id, n, self._demo_mode)
 
-        candidates = self.cosmos.scan_subaccounts(
-            max_pages=3, page_size=100, min_usdc=500.0, only_with_positions=True,
-        )
+        if self._demo_mode:
+            # Mode démo: retourner des wallets synthétiques immédiatement
+            shortlist = _build_demo_wallets()
+            finished = int(time.time() * 1000)
+            logger.info("fast_discover DEMO: %d wallets synthétiques", len(shortlist))
+            return DiscoveryResult(
+                run_id=run_id, started_at_ms=started, finished_at_ms=finished,
+                candidates_scanned=0, shortlisted=shortlist,
+                discovery_method="demo_synthetic",
+            )
+
+        candidates = []
+        try:
+            candidates = self.cosmos.scan_subaccounts(
+                max_pages=3, page_size=100, min_usdc=500.0, only_with_positions=True,
+            )
+        except Exception as e:
+            logger.warning("Cosmos LCD unavailable: %s — activating demo mode", e)
+            self._demo_mode = True
+            shortlist = _build_demo_wallets()
+            finished = int(time.time() * 1000)
+            logger.info("fast_discover DEMO (fallback): %d wallets synthétiques", len(shortlist))
+            return DiscoveryResult(
+                run_id=run_id, started_at_ms=started, finished_at_ms=finished,
+                candidates_scanned=0, shortlisted=shortlist,
+                discovery_method="demo_synthetic_fallback",
+            )
+
         logger.info("fast_discover scan: %d candidats", len(candidates))
 
         scored = []
@@ -120,6 +220,15 @@ class DydxWalletDiscovery:
         scored.sort(key=lambda x: x.total_score, reverse=True)
         shortlist = scored[:n]
 
+        # Fallback démo si aucun wallet réel trouvé
+        if not shortlist:
+            logger.warning("fast_discover: 0 wallets réels — injection démo synthétique")
+            shortlist = _build_demo_wallets()
+            self._demo_mode = True
+            discovery_method = "demo_synthetic_fallback"
+        else:
+            discovery_method = "fast_cosmos_lcd"
+
         finished = int(time.time() * 1000)
         logger.info(
             "fast_discover DONE: %d wallets en %.1fs | %s",
@@ -128,7 +237,7 @@ class DydxWalletDiscovery:
         return DiscoveryResult(
             run_id=run_id, started_at_ms=started, finished_at_ms=finished,
             candidates_scanned=len(candidates), shortlisted=shortlist,
-            discovery_method="fast_cosmos_lcd",
+            discovery_method=discovery_method,
         )
 
     def discover_top_wallets(self, n: int = 20) -> DiscoveryResult:
@@ -305,7 +414,7 @@ class DydxWalletDiscovery:
                         del open_pos[key]
 
             if total >= 3:
-                # ── Viral bot: compute_account_score avec one-big-win filter ──
+                # -- Viral bot: compute_account_score avec one-big-win filter --
                 account_score = compute_account_score(
                     account_address=ws.address,
                     subaccount_number=ws.subaccount_number,
@@ -349,5 +458,5 @@ class DydxWalletDiscovery:
 
 
 def build_seed_shortlist() -> list[WalletScore]:
-    """Shortlist initiale vide — remplacée au démarrage par fast_discover()."""
+    """Shortlist initiale vide."""
     return []

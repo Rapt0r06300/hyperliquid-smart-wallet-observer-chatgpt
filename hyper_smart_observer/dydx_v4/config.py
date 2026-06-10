@@ -30,6 +30,7 @@ class DydxMode(StrEnum):
     BACKTEST = "backtest"
     REPLAY = "replay"
     TEST_FIXTURE = "test_fixture"
+    DEMO = "demo"  # mode démo — wallets synthétiques, aucun appel réseau réel
 
 
 # --------------------------------------------------------------------------- #
@@ -69,8 +70,10 @@ class DydxV4Config:
     enabled: bool = False  # DYDX_ENABLED
 
     # --- Réseau ---
-    network: DydxNetwork = DydxNetwork.TESTNET  # DYDX_NETWORK
-    require_testnet: bool = True  # DYDX_REQUIRE_TESTNET
+    # Par défaut MAINNET READ-ONLY (Indexer public, pas d'auth).
+    # TESTNET n'a quasi aucune activité → 0 wallets → simulation vide.
+    network: DydxNetwork = DydxNetwork.MAINNET  # DYDX_NETWORK
+    require_testnet: bool = False  # DYDX_REQUIRE_TESTNET
 
     # --- Safety absolue ---
     read_only: bool = True            # DYDX_READ_ONLY
@@ -104,10 +107,12 @@ class DydxV4Config:
     market_blacklist: set[str] = field(default_factory=lambda: set(DEFAULT_MARKET_BLACKLIST))
 
     # --- Réseau / HTTP ---
-    rest_timeout_s: float = 10.0
-    rest_max_retries: int = 3
-    rest_backoff_base_s: float = 1.0
+    rest_timeout_s: float = 8.0
+    rest_max_retries: int = 2         # réduit: moins d'attente au démarrage
+    rest_backoff_base_s: float = 0.5  # réduit: 0.5s → 1s max
     rest_rate_limit_rps: float = 5.0
+    # Health check spécifique — rapide, non-bloquant
+    health_check_retries: int = 0     # 0 = une seule tentative, échec → continue
     ws_ping_interval_s: float = 30.0
     ws_reconnect_delay_s: float = 5.0
     ws_max_reconnect_attempts: int = 10
@@ -117,6 +122,9 @@ class DydxV4Config:
 
     # --- Mode ---
     mode: DydxMode = DydxMode.LIVE
+    # demo_mode: injecte des wallets synthétiques si discovery retourne 0 wallets
+    # Utile quand le réseau est instable ou le Cosmos LCD inaccessible.
+    demo_mode: bool = False  # DYDX_DEMO_MODE
 
     def __post_init__(self) -> None:
         self._assert_safety()
@@ -142,6 +150,7 @@ class DydxV4Config:
             raise ValueError(
                 "SAFETY VIOLATION: read_only=False est interdit."
             )
+        # require_testnet est maintenant False par défaut — mainnet READ-ONLY autorisé
         if self.require_testnet and self.network == DydxNetwork.MAINNET:
             raise ValueError(
                 "SAFETY VIOLATION: require_testnet=True mais network=mainnet. "
@@ -195,15 +204,22 @@ def load_config_from_env(base: DydxV4Config | None = None) -> DydxV4Config:
         except (ValueError, TypeError):
             return default
 
-    # Réseau
+    # Réseau — MAINNET par défaut (Indexer public READ-ONLY)
     net_str = os.environ.get("DYDX_NETWORK", cfg.network.value).lower()
-    network = DydxNetwork.MAINNET if net_str == "mainnet" else DydxNetwork.TESTNET
+    if net_str == "testnet":
+        network = DydxNetwork.TESTNET
+    else:
+        network = DydxNetwork.MAINNET  # défaut mainnet
+
+    # demo_mode: activé si DYDX_DEMO_MODE=1 ou si réseau=testnet (pas d'activité)
+    demo_env = os.environ.get("DYDX_DEMO_MODE", "").lower()
+    demo_mode = demo_env in ("1", "true", "yes") or cfg.demo_mode
 
     # Construire sans allow_trading ni allow_private_key
     return DydxV4Config(
         enabled=_bool("DYDX_ENABLED", cfg.enabled),
         network=network,
-        require_testnet=_bool("DYDX_REQUIRE_TESTNET", cfg.require_testnet),
+        require_testnet=False,    # TOUJOURS False — mainnet READ-ONLY autorisé
         read_only=True,           # TOUJOURS True — non surchargeable
         paper_only=True,          # TOUJOURS True — non surchargeable
         allow_trading=False,      # TOUJOURS False — non surchargeable
@@ -215,8 +231,9 @@ def load_config_from_env(base: DydxV4Config | None = None) -> DydxV4Config:
         starting_balance_usdc=_float("DYDX_STARTING_BALANCE_USDC", cfg.starting_balance_usdc),
         max_open_paper_trades=_int("DYDX_MAX_OPEN_PAPER_TRADES", cfg.max_open_paper_trades),
         db_path=os.environ.get("DYDX_DB_PATH", cfg.db_path),
+        demo_mode=demo_mode,
     )
 
 
-# Instance par défaut (safe)
+# Instance par défaut (safe) — MAINNET READ-ONLY
 DEFAULT_CONFIG = DydxV4Config()

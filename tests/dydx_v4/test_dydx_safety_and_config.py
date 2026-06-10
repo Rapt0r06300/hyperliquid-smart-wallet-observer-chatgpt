@@ -42,9 +42,10 @@ class TestDefaultConfig:
         cfg = DydxV4Config()
         assert cfg.allow_private_key is False
 
-    def test_network_is_testnet_by_default(self):
+    def test_network_is_mainnet_by_default(self):
+        # MAINNET par défaut depuis migration (TESTNET n'a aucune activité → 0 wallets)
         cfg = DydxV4Config()
-        assert cfg.network == DydxNetwork.TESTNET
+        assert cfg.network == DydxNetwork.MAINNET
 
     def test_enabled_is_false_by_default(self):
         cfg = DydxV4Config()

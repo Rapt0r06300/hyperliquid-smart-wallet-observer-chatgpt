@@ -34,6 +34,7 @@ class EngineStatus:
     running: bool = False
     started_at_ms: int = 0
     network: str = "mainnet"
+    demo_mode: bool = False
     rest_url: str = ""
     rest_healthy: bool = False
     iteration: int = 0
@@ -66,20 +67,31 @@ class DydxEngine:
 
     def __init__(self, config: Optional[DydxV4Config] = None) -> None:
         self._config = config or load_config_from_env()
-        # Par défaut: mainnet READ-ONLY pour scanner les vrais wallets
-        if self._config.network.value == "testnet" and not config:
+        # config.py defaulte maintenant sur MAINNET — ce bloc est conservé comme
+        # filet de sécurité au cas où une config externe forcerait testnet.
+        if getattr(self._config, 'network', None) and str(self._config.network) == "testnet" and not config:
             import dataclasses
             self._config = dataclasses.replace(
                 self._config, network=DydxNetwork.MAINNET, require_testnet=False
             )
         assert_paper_only(self._config)
 
+        # Client REST principal (mainnet par défaut)
         self._rest = DydxIndexerRestClient(
             base_url=self._config.indexer_rest_url,
             timeout_s=self._config.rest_timeout_s,
             max_retries=self._config.rest_max_retries,
             backoff_base_s=self._config.rest_backoff_base_s,
             rate_limit_rps=self._config.rest_rate_limit_rps,
+        )
+
+        # Client REST léger pour le health check (0 retry → non-bloquant)
+        self._health_rest = DydxIndexerRestClient(
+            base_url=self._config.indexer_rest_url,
+            timeout_s=4.0,
+            max_retries=getattr(self._config, 'health_check_retries', 0),
+            backoff_base_s=0.0,
+            rate_limit_rps=10.0,
         )
 
         self._cosmos = DydxCosmosLcdClient()
@@ -90,6 +102,7 @@ class DydxEngine:
         self._discovery = DydxWalletDiscovery(
             rest_client=self._rest,
             cosmos_client=self._cosmos,
+            demo_mode=getattr(self._config, 'demo_mode', False),
         )
         self._observer: Optional[DydxLiveObserver] = None
         self._thread: Optional[threading.Thread] = None
@@ -149,6 +162,7 @@ class DydxEngine:
                     sorted(s.no_trade_reasons.items(), key=lambda x: -x[1])[:10]
                 ),
                 "leader_exits": s.leader_exits,
+                "demo_mode": s.demo_mode,
             }
 
     def get_wallets(self) -> list[dict]:
@@ -202,17 +216,26 @@ class DydxEngine:
         """Boucle principale dans le thread daemon."""
         assert_paper_only(self._config)
 
-        # Health check initial
+        # Health check initial — non-bloquant (0 retry, 4s timeout max)
+        # Un échec ne stoppe pas le moteur, la simulation continue.
         try:
-            health = self._rest.get_health()
+            health = self._health_rest.get_health()
             with self._lock:
                 self._status.rest_healthy = True
+                self._status.last_error = ""
             logger.info("dYdX Indexer health OK: %s", health)
         except Exception as e:
             with self._lock:
-                self._status.last_error = f"REST health check failed: {e}"
                 self._status.rest_healthy = False
-            logger.warning("dYdX Indexer health FAILED: %s", e)
+                # Ne pas bloquer: last_error sera mis à jour plus tard
+                self._status.last_error = "REST_UNREACHABLE"
+            logger.warning("dYdX Indexer health FAILED (non-bloquant): %s", e)
+            # Mode démo automatique si REST inaccessible
+            if not self._config.demo_mode:
+                import dataclasses
+                self._config = dataclasses.replace(self._config, demo_mode=True)
+                self._discovery._demo_mode = True
+                logger.info("REST inaccessible → mode DEMO activé automatiquement")
 
         # Créer l'observer
         self._observer = DydxLiveObserver(
@@ -228,6 +251,7 @@ class DydxEngine:
             self._status.running = True
             self._status.started_at_ms = int(time.time() * 1000)
             self._status.session_id = self._observer.stats.session_id
+            self._status.demo_mode = getattr(self._config, 'demo_mode', False)
 
         # Patch: hook _poll_shortlist (nom exact) pour sync stats après chaque itération
         original_poll = self._observer._poll_shortlist
@@ -288,13 +312,13 @@ class DydxEngine:
             )
 
 
-# Singleton global — thread-safe via .start()
+# Singleton global -- thread-safe via .start()
 _engine: Optional[DydxEngine] = None
 _engine_lock = threading.Lock()
 
 
 def get_engine() -> DydxEngine:
-    """Retourne le singleton DydxEngine (créé si inexistant)."""
+    """Retourne le singleton DydxEngine (cree si inexistant)."""
     global _engine
     with _engine_lock:
         if _engine is None:
@@ -303,7 +327,7 @@ def get_engine() -> DydxEngine:
 
 
 def start_engine() -> DydxEngine:
-    """Démarre le moteur dYdX v4 (idempotent)."""
+    """Demarre le moteur dYdX v4 (idempotent)."""
     engine = get_engine()
     engine.start()
     return engine
