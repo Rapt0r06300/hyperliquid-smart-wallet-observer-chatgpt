@@ -78,6 +78,8 @@ class DiscoveryResult:
 # Wallets synthétiques pour le mode démo (aucun réseau requis)
 # ---------------------------------------------------------------------------
 _DEMO_WALLET_SPECS = [
+    # ALPHA, BETA, GAMMA partagent tous ETH-USD LONG + BTC-USD LONG
+    # → detect_clusters(min_wallets=2) détecte 2 clusters dès le tick 1
     {
         "address": "dydx1qjfsuqfpjqfsuqfpjqfsuqfpjqfsuqfpjfaa",
         "label": "DEMO-ALPHA",
@@ -86,32 +88,35 @@ _DEMO_WALLET_SPECS = [
             {"market": "BTC-USD", "side": "LONG", "notional": 8000},
         ],
         "balance": 50000,
-        "winrate": 0.58,
-        "profit_factor": 1.72,
-        "score": 0.78,
+        "winrate": 0.61,
+        "profit_factor": 1.85,
+        "score": 0.82,
     },
     {
         "address": "dydx1rjfsuqfpjqfsuqfpjqfsuqfpjqfsuqfpjfbb",
         "label": "DEMO-BETA",
+        # BUG FIX: était ETH SHORT + SOL LONG → aucun overlap possible
         "markets": [
-            {"market": "SOL-USD", "side": "LONG", "notional": 6000},
-            {"market": "ETH-USD", "side": "SHORT", "notional": 5000},
+            {"market": "ETH-USD", "side": "LONG", "notional": 12000},
+            {"market": "BTC-USD", "side": "LONG", "notional": 10000},
         ],
-        "balance": 30000,
-        "winrate": 0.54,
-        "profit_factor": 1.45,
-        "score": 0.65,
+        "balance": 40000,
+        "winrate": 0.58,
+        "profit_factor": 1.65,
+        "score": 0.75,
     },
     {
         "address": "dydx1sjfsuqfpjqfsuqfpjqfsuqfpjqfsuqfpjfcc",
         "label": "DEMO-GAMMA",
+        # BUG FIX: était BTC SHORT → aucun overlap avec ALPHA
         "markets": [
-            {"market": "BTC-USD", "side": "SHORT", "notional": 20000},
+            {"market": "BTC-USD", "side": "LONG", "notional": 20000},
+            {"market": "ETH-USD", "side": "LONG", "notional": 10000},
         ],
         "balance": 80000,
-        "winrate": 0.61,
+        "winrate": 0.63,
         "profit_factor": 1.95,
-        "score": 0.82,
+        "score": 0.85,
     },
 ]
 

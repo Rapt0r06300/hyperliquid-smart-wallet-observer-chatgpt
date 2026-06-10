@@ -494,18 +494,21 @@ class DydxLiveObserver:
 
     def _inject_demo_prices(self) -> None:
         """Injecte des prix synthétiques avec micro-drift pour le mode DEMO.
+        Légère tendance haussière (+0.05%/tick en espérance) pour simuler
+        un marché favorable aux positions LONG des leaders démo.
         PAPER SIMULATION ONLY — ces prix sont FICTIFS.
         """
         import random
         rng = random.Random(int(time.time()) // 5)  # change toutes les 5s
         for market, base in self._DEMO_BASE_PRICES.items():
             existing = self._mark_prices.get(market, base)
-            # Drift max ±0.15% par tick (réaliste pour 5s)
-            drift = rng.uniform(-0.0015, 0.0015)
+            # Drift asymétrique: -0.10% à +0.20% → espérance +0.05%/tick
+            # Simule un marché bull réaliste, favorable aux positions LONG
+            drift = rng.uniform(-0.0010, 0.0020)
             new_price = existing * (1.0 + drift)
             # Ancrer autour du prix de base (±5% max)
             if abs(new_price - base) / base > 0.05:
-                new_price = base * (1.0 + rng.uniform(-0.02, 0.02))
+                new_price = base * (1.0 + rng.uniform(-0.01, 0.03))
             self._mark_prices[market] = round(new_price, 4)
 
     def _poll_shortlist(self) -> None:
@@ -527,12 +530,26 @@ class DydxLiveObserver:
     def _poll_shortlist_demo(self) -> None:
         """
         Simulation synthétique pour mode DEMO — sans appels REST.
-        Chaque wallet démo tourne ses positions toutes les ~12 ticks (≈60s).
+        Toutes les 10 ticks (≈50s), les snapshots sont réinitialisés pour
+        rejouer des événements OPEN frais → detect_clusters() trouve des clusters
+        et peut rouvrir des positions après un SL/TP.
         PAPER SIMULATION ONLY. Aucun argent réel.
         """
         import random
         rng = random.Random(self._demo_tick)
         now_ms = int(time.time() * 1000)
+
+        # FIX: Reset périodique (ticks 1, 11, 21...) pour générer des OPENs frais.
+        # Sans ce reset, les signaux vieillissent > 8s et aucun trade ne s'ouvre
+        # après le premier cycle SL/TP.
+        if self._demo_tick % 10 == 1:
+            for w in self._shortlist:
+                k = f"{w.address}/{w.subaccount_number}"
+                self._position_snapshots.pop(k, None)
+            logger.debug(
+                "DEMO tick=%d: snapshots réinitialisés → OPENs frais pour tous les wallets",
+                self._demo_tick,
+            )
 
         for wallet in self._shortlist:
             wallet_key = f"{wallet.address}/{wallet.subaccount_number}"
