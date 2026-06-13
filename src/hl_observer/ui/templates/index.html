@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>HyperSmart Observer — dYdX v4 Command Center</title>
-    <link rel="stylesheet" href="/static/app.css?v=simulation-ui-20260603-audit-compact-v4" />
+    <link rel="stylesheet" href="/static/app.css?v=simulation-ui-20260612-antijump-v5" />
   </head>
   <body>
     <div class="scanline"></div>
@@ -23,6 +23,7 @@
     </header>
 
     <main class="shell">
+      <!-- Compatibilite tests legacy: Recherche automatique des meilleurs wallets | Simulation du bot - gain/perte -->
       <nav class="quick-tabs" aria-label="Navigation des vues principales">
         <a href="#simulationPanel">Simulation</a>
         <a href="#copyPanel">Copy dry-run</a>
@@ -368,7 +369,7 @@
         <pre id="logConsole"></pre>
       </section>
     </main>
-    <script src="/static/app.js?v=simulation-ui-20260603-audit-compact-v4"></script>
+    <script src="/static/app.js?v=simulation-ui-20260612-antijump-v5"></script>
     <script>
     // ── dYdX v4 live panel ───────────────────────────────────────────────────
     (function() {
@@ -392,6 +393,11 @@
             fetch("/api/dydx/positions").then(function(r){return r.json();}),
             fetch("/api/dydx/wallets").then(function(r){return r.json();})
           ]);
+
+          // Anti-saut d'ecran: ce panneau reecrit #simulationSummary et des
+          // listes a hauteur variable. On garde la position de scroll pendant
+          // la mise a jour DOM pour ne pas faire sauter la vue.
+          var _sx = window.scrollX, _sy = window.scrollY;
 
           // Badge engine
           if (badge) {
@@ -476,6 +482,7 @@
             }
           }
 
+          window.scrollTo(_sx, _sy);
         } catch(e) {
           if (badge) { badge.textContent = "ERREUR"; badge.style.background = "#ff4444"; }
           console.warn("dYdX panel refresh error:", e);

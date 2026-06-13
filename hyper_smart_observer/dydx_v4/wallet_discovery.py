@@ -197,7 +197,7 @@ class DydxWalletDiscovery:
         candidates = []
         try:
             candidates = self.cosmos.scan_subaccounts(
-                max_pages=3, page_size=100, min_usdc=500.0, only_with_positions=True,
+                max_pages=60, page_size=100, min_usdc=250.0, only_with_positions=True,
             )
         except Exception as e:
             logger.warning("Cosmos LCD unavailable: %s — activating demo mode", e)
@@ -220,7 +220,7 @@ class DydxWalletDiscovery:
                 scored.append(ws)
 
         scored.sort(key=lambda x: x.total_score, reverse=True)
-        for ws in scored[:5]:
+        for ws in scored[:20]:
             self._enrich_with_indexer(ws)
         scored.sort(key=lambda x: x.total_score, reverse=True)
         shortlist = scored[:n]

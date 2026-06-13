@@ -641,6 +641,13 @@ input {
 
 .table-wrap { overflow-x: auto; }
 
+/* Anti-saut: hauteur stable des elements a contenu variable (panneau dYdX inline
+   + bandeau live + resume), pour qu'un refresh ne change jamais la hauteur de
+   page (donc plus de saut d'ecran entre panneaux). */
+#dydxPositionsList, #dydxNoTradePanel { max-height: 96px; overflow: auto; }
+#simulationLiveStrip { min-height: 132px; }
+#simulationSummary { min-height: 96px; }
+
 table {
   width: 100%;
   border-collapse: collapse;

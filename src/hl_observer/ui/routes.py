@@ -1614,7 +1614,7 @@ def create_router(settings: Settings, state: UiState, bus: UiEventBus) -> APIRou
         ]
         safety_status = "STOPPED" if state.kill_switch_active else ("SAFE" if audit.ok else "WARNING")
         return UiStatus(
-            app_name="HyperSmart Observer — dYdX v4",
+            app_name="Hyperliquid Smart-Wallet Observer",
             version=__version__,
             mode=settings.environment.value.upper(),
             db_path=settings.database_url,

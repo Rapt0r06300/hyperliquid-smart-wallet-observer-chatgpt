@@ -71,6 +71,10 @@ class ClusterSignal:
     is_fresh: bool          # True si signal_age_ms < 4000
     cluster_id: str
     detected_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+    # Origine: "rest" (poll positions) ou "stream" (full node firehose temps réel).
+    # Les clusters "stream" sautent la gate proven (qualité = consensus K wallets).
+    origin: str = "rest"
+    flow_trade_count: Optional[int] = None
 
     @property
     def is_actionable(self) -> bool:

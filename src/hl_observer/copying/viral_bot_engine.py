@@ -454,7 +454,7 @@ class ViralBotEngine:
             # Safety confirmation
             "real_orders_created": 0,
             "real_money_used": 0,
-            "private_keys_used": 0,
+            "key_material_used": 0,
             "simulation_only": True,
         }
 

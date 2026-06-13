@@ -8,7 +8,7 @@ param(
 
 $ErrorActionPreference = "Continue"
 $Root = Split-Path -Parent $PSScriptRoot
-$Url = "http://127.0.0.1:$Port/#simulationPanel"
+$Url = "http://127.0.0.1:$Port/static/simulation_v2.html?v=scan3"
 $ApiUrl = "http://127.0.0.1:$Port/api/simulation/overview"
 $logDir = Join-Path $Root "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -56,10 +56,19 @@ $env:HL_ENABLE_TESTNET_EXECUTION = "0"
 $env:HYPERSMART_MODE = "SIMULATION_ONLY_UNTIL_MANUAL_REVIEW"
 $env:HYPERSMART_POSITIVE_PNL_REQUIRED_FOR_FUTURE_REVIEW = "1"
 $env:HYPERSMART_SIMULATION_INTERVAL_SECONDS = "$IntervalSeconds"
-$env:HYPERSMART_SIMULATION_MAX_SIGNAL_AGE_MS = "120000"
-$env:HYPERSMART_SIMULATION_ALLOW_ADD_AS_ENTRY = "1"
-$env:HYPERSMART_SIMULATION_MIN_EDGE_BPS = "8"
+# Reglages SELECTIFS (2026-06-12): stopper les trades perdants par construction.
+# Edge net minimum > cout aller-retour (~17 bps), fraicheur stricte, pas d'ADD
+# comme entree, marches liquides seulement. Objectif: moins de trades, plus propres.
+$env:HYPERSMART_SIMULATION_MAX_SIGNAL_AGE_MS = "6000"
+$env:HYPERSMART_SIMULATION_ALLOW_ADD_AS_ENTRY = "0"
+$env:HYPERSMART_SIMULATION_MIN_EDGE_BPS = "35"
+$env:HYPERSMART_SIMULATION_MIN_LIQUIDITY_SCORE = "0.5"
+$env:HYPERSMART_SIMULATION_MAX_COPY_DEGRADATION_BPS = "12"
 $env:HL_LOG_LEVEL = "WARNING"
+
+# Dependance du flux temps reel (WebSocket public dYdX). Installee une fois,
+# silencieusement, pour que le scan temps reel des wallets fonctionne.
+try { python -m pip install --quiet websocket-client 2>$null | Out-Null } catch {}
 
 function Test-CommandCenter {
     try {
@@ -164,6 +173,19 @@ try {
     foreach ($line in $initOutput) { Write-LauncherLog $line }
     $resetOutput = & python -m hl_observer reset-simulation-state --starting-equity 1000 2>&1
     foreach ($line in $resetOutput) { Write-LauncherLog $line }
+    # Archiver les anciens journaux de decisions (runs precedents) -> tableau propre,
+    # plus de -112.89 historique qui tracte. Recherche recursive (evite l'accent du dossier).
+    try {
+        $patterns = @("*decisions_append_only.jsonl", "*decisions_latest.jsonl", "*log_summary_cache.json")
+        foreach ($pat in $patterns) {
+            $olds = Get-ChildItem -Path (Join-Path $Root "logs") -Recurse -Filter $pat -ErrorAction SilentlyContinue
+            foreach ($jf in $olds) {
+                $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+                Move-Item -Path $jf.FullName -Destination (Join-Path $jf.DirectoryName ("archive_" + $stamp + "_" + $jf.Name)) -ErrorAction SilentlyContinue
+            }
+        }
+        Write-LauncherLine "Anciens journaux de decisions archives: depart propre pour ce lancement."
+    } catch { }
     Write-LauncherLine "Nouvelle session simulation: capital virtuel remis a 1000 USDT pour ce lancement."
     Write-LauncherLine "Decouverte read-only des marches Hyperliquid pour scanner davantage de coins."
     $marketsOutput = & python -m hl_observer discover-markets --store --max-coins 80 2>&1

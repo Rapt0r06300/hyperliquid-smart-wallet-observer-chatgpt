@@ -1,16 +1,18 @@
 """
 DydxEngine — moteur dYdX v4 thread-safe.
 
-Démarre DydxLiveObserver dans un thread daemon.
-Expose l'état via des accesseurs thread-safe.
-PAPER-ONLY. Aucun ordre réel. Aucune clé privée.
+Demarre DydxLiveObserver dans un thread daemon.
+Expose l'etat via des accesseurs thread-safe.
+PAPER-ONLY. Aucun ordre reel. Aucune cle privee.
 """
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from hyper_smart_observer.dydx_v4.cluster_detector import DydxClusterDetector
@@ -22,6 +24,44 @@ from hyper_smart_observer.dydx_v4.wallet_discovery import DydxWalletDiscovery
 from hyper_smart_observer.dydx_v4.safety import assert_paper_only
 
 logger = logging.getLogger(__name__)
+
+_logging_configured = False
+
+
+def _ensure_file_logging() -> None:
+    """Ajoute un FileHandler si aucun n'est deja configure sur le root logger."""
+    global _logging_configured
+    if _logging_configured:
+        return
+    _logging_configured = True
+    root = logging.getLogger()
+    if any(isinstance(h, logging.FileHandler) for h in root.handlers):
+        return
+    try:
+        here = Path(__file__).resolve()
+        project_root = Path.cwd()
+        for parent in here.parents:
+            if (parent / "pyproject.toml").exists():
+                project_root = parent
+                break
+        log_dir = project_root / "logs" / "logs à envoyer"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(
+            log_dir / "hypersmart_observer.log",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s %(message)s"
+        ))
+        root.addHandler(fh)
+        if root.level == logging.WARNING or root.level == 0:
+            root.setLevel(logging.INFO)
+        logger.info("File logging actif: %s", log_dir / "hypersmart_observer.log")
+    except OSError as e:
+        logger.warning("File logging impossible: %s", e)
+
 
 DISCLAIMER = (
     "dYdX v4 PAPER SIMULATION — READ-ONLY public Indexer API. "
@@ -41,7 +81,7 @@ class EngineStatus:
     wallets_in_shortlist: int = 0
     open_positions: int = 0
     net_pnl_usdt: float = 0.0
-    equity_usdt: float = 1000.0
+    equity_usdt: float = 0.0
     total_trades: int = 0
     winrate: float = 0.0
     signals_refused: int = 0
@@ -52,11 +92,12 @@ class EngineStatus:
     session_id: str = ""
     no_trade_reasons: dict = field(default_factory=dict)
     leader_exits: int = 0
+    observer_status: dict = field(default_factory=dict)
 
 
 class DydxEngine:
     """
-    Moteur dYdX v4 — thread daemon paper-only.
+    Moteur dYdX v4 -- thread daemon paper-only.
 
     Usage:
         engine = DydxEngine()
@@ -67,8 +108,6 @@ class DydxEngine:
 
     def __init__(self, config: Optional[DydxV4Config] = None) -> None:
         self._config = config or load_config_from_env()
-        # config.py defaulte maintenant sur MAINNET — ce bloc est conservé comme
-        # filet de sécurité au cas où une config externe forcerait testnet.
         if getattr(self._config, 'network', None) and str(self._config.network) == "testnet" and not config:
             import dataclasses
             self._config = dataclasses.replace(
@@ -76,7 +115,6 @@ class DydxEngine:
             )
         assert_paper_only(self._config)
 
-        # Client REST principal (mainnet par défaut)
         self._rest = DydxIndexerRestClient(
             base_url=self._config.indexer_rest_url,
             timeout_s=self._config.rest_timeout_s,
@@ -85,7 +123,6 @@ class DydxEngine:
             rate_limit_rps=self._config.rest_rate_limit_rps,
         )
 
-        # Client REST léger pour le health check (0 retry → non-bloquant)
         self._health_rest = DydxIndexerRestClient(
             base_url=self._config.indexer_rest_url,
             timeout_s=4.0,
@@ -114,10 +151,11 @@ class DydxEngine:
             rest_url=self._config.indexer_rest_url,
         )
 
-    # ── public API ──────────────────────────────────────────────────────────
+    # -- public API --
 
     def start(self) -> None:
-        """Démarre le thread daemon paper-only."""
+        """Demarre le thread daemon paper-only."""
+        _ensure_file_logging()
         assert_paper_only(self._config)
         if self._thread and self._thread.is_alive():
             logger.info("DydxEngine already running")
@@ -131,7 +169,7 @@ class DydxEngine:
         logger.info("DydxEngine started | %s", DISCLAIMER)
 
     def stop(self) -> None:
-        """Arrête l'observateur proprement."""
+        """Arrete l'observateur proprement."""
         if self._observer:
             self._observer.stop()
         logger.info("DydxEngine stopped")
@@ -139,7 +177,7 @@ class DydxEngine:
     def get_status(self) -> dict:
         with self._lock:
             s = self._status
-            return {
+            status = {
                 "running": s.running,
                 "started_at_ms": s.started_at_ms,
                 "network": s.network,
@@ -164,6 +202,22 @@ class DydxEngine:
                 "leader_exits": s.leader_exits,
                 "demo_mode": s.demo_mode,
             }
+            observer_status = dict(s.observer_status or {})
+
+        if observer_status:
+            status.update(observer_status)
+            if "net_pnl_usdc" in observer_status:
+                status["net_pnl_usdt"] = round(float(observer_status.get("net_pnl_usdc") or 0.0), 4)
+            if "realized_pnl_usdc" in observer_status:
+                status["realized_pnl_usdt"] = round(float(observer_status.get("realized_pnl_usdc") or 0.0), 4)
+            if "unrealized_pnl_usdc" in observer_status:
+                status["unrealized_pnl_usdt"] = round(float(observer_status.get("unrealized_pnl_usdc") or 0.0), 4)
+            if "equity" in observer_status:
+                status["equity_usdt"] = round(float(observer_status.get("equity") or self._config.starting_balance_usdc), 4)
+            status["wallets_in_shortlist"] = int(
+                observer_status.get("shortlist_size", status.get("wallets_in_shortlist", 0)) or 0
+            )
+        return status
 
     def get_wallets(self) -> list[dict]:
         if not self._observer:
@@ -183,22 +237,26 @@ class DydxEngine:
         if not self._observer:
             return []
         with self._lock:
-            return [
-                {
+            marks = self._observer._mark_prices
+            out = []
+            for pos in self._observer._open_positions.values():
+                mark = marks.get(pos.market_id) or pos.entry_price
+                out.append({
                     "position_id": pos.position_id,
                     "market_id": pos.market_id,
                     "side": pos.side,
                     "size": round(pos.size, 4),
                     "entry_price": round(pos.entry_price, 4),
+                    "mark_price": round(mark, 6),
+                    "unrealized_pnl_usdc": round(pos.calculate_pnl(mark), 4),
                     "stop_loss": round(pos.stop_loss_price, 4),
                     "take_profit": round(pos.take_profit_price, 4),
                     "opened_at_ms": pos.opened_at_ms,
                     "wallet_count": pos.wallet_count,
                     "fee_paid": round(pos.fee_paid, 4),
                     "cluster_id": pos.cluster_id,
-                }
-                for pos in self._observer._open_positions.values()
-            ]
+                })
+            return out
 
     def get_closed_trades(self, limit: int = 50) -> list[dict]:
         if not self._observer:
@@ -210,14 +268,12 @@ class DydxEngine:
             return {}
         return dict(self._observer._mark_prices)
 
-    # ── internal ────────────────────────────────────────────────────────────
+    # -- internal --
 
     def _run_loop(self) -> None:
         """Boucle principale dans le thread daemon."""
         assert_paper_only(self._config)
 
-        # Health check initial — non-bloquant (0 retry, 4s timeout max)
-        # Un échec ne stoppe pas le moteur, la simulation continue.
         try:
             health = self._health_rest.get_health()
             with self._lock:
@@ -227,24 +283,22 @@ class DydxEngine:
         except Exception as e:
             with self._lock:
                 self._status.rest_healthy = False
-                # Ne pas bloquer: last_error sera mis à jour plus tard
                 self._status.last_error = "REST_UNREACHABLE"
             logger.warning("dYdX Indexer health FAILED (non-bloquant): %s", e)
-            # Mode démo automatique si REST inaccessible
             if not self._config.demo_mode:
                 import dataclasses
                 self._config = dataclasses.replace(self._config, demo_mode=True)
                 self._discovery._demo_mode = True
-                logger.info("REST inaccessible → mode DEMO activé automatiquement")
+                logger.info("REST inaccessible -> mode DEMO active automatiquement")
 
-        # Créer l'observer
         self._observer = DydxLiveObserver(
             config=self._config,
             rest_client=self._rest,
             cluster_detector=self._cluster,
             discovery=self._discovery,
             poll_interval_s=5.0,
-            max_signal_age_ms=8_000,
+            max_signal_age_ms=self._config.max_signal_age_ms,
+            cosmos_client=self._cosmos,
         )
 
         with self._lock:
@@ -253,7 +307,6 @@ class DydxEngine:
             self._status.session_id = self._observer.stats.session_id
             self._status.demo_mode = getattr(self._config, 'demo_mode', False)
 
-        # Patch: hook _poll_shortlist (nom exact) pour sync stats après chaque itération
         original_poll = self._observer._poll_shortlist
 
         def _patched_poll(*args, **kwargs):
@@ -263,7 +316,6 @@ class DydxEngine:
 
         self._observer._poll_shortlist = _patched_poll
 
-        # Timer de sync de secours: toutes les 3s (couvre discovery_running + positions)
         def _sync_timer():
             while self._observer and self._status.running:
                 self._sync_stats()
@@ -273,7 +325,7 @@ class DydxEngine:
         sync_thread.start()
 
         try:
-            self._observer.run()  # bloquant jusqu'à stop()
+            self._observer.run()
         except Exception as e:
             logger.error("DydxEngine loop error: %s", e, exc_info=True)
             with self._lock:
@@ -288,28 +340,30 @@ class DydxEngine:
         if not self._observer:
             return
         s = self._observer.stats
+        observer_status = self._observer.get_status()
+        observer_status["winning_trades"] = s.winning_trades
+        observer_status["losing_trades"] = s.losing_trades
         with self._lock:
             self._status.iteration += 1
             self._status.wallets_in_shortlist = len(self._observer._shortlist)
             self._status.open_positions = len(self._observer._open_positions)
-            self._status.net_pnl_usdt = s.total_net_pnl_usdc
-            self._status.equity_usdt = s.equity
+            self._status.net_pnl_usdt = float(observer_status.get("net_pnl_usdc", s.total_net_pnl_usdc) or 0.0)
+            self._status.equity_usdt = float(observer_status.get("equity", s.equity) or 1000.0)
             self._status.total_trades = s.positions_closed
             self._status.winrate = s.winrate
             self._status.signals_refused = s.signals_refused
             self._status.stale_refused = s.stale_signals_refused
             self._status.fees_paid = s.total_fees_paid
-            # Injecter discovery_running dans last_error (UI feedback)
             if self._observer._discovery_running:
                 self._status.last_error = "DISCOVERY_RUNNING"
             elif self._status.last_error == "DISCOVERY_RUNNING":
                 self._status.last_error = ""
-            # no_trade_reasons + leader_exits (viral bot)
             self._status.no_trade_reasons = dict(self._observer._no_trade_reasons)
             self._status.leader_exits = sum(
                 1 for t in self._observer._closed_trades
                 if t.get("reason") == "LEADER_EXIT"
             )
+            self._status.observer_status = observer_status
 
 
 # Singleton global -- thread-safe via .start()

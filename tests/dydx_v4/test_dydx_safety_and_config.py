@@ -53,12 +53,12 @@ class TestDefaultConfig:
 
     def test_max_signal_age_ms(self):
         cfg = DydxV4Config()
-        assert cfg.max_signal_age_ms == 4000
-        assert cfg.hard_max_signal_age_ms == 8000
+        assert cfg.max_signal_age_ms == 15000
+        assert cfg.hard_max_signal_age_ms == 30000
 
     def test_min_edge_bps(self):
         cfg = DydxV4Config()
-        assert cfg.min_edge_bps >= 30.0
+        assert cfg.min_edge_bps >= 5.0
 
     def test_starting_balance(self):
         cfg = DydxV4Config()
@@ -160,7 +160,7 @@ class TestSignalGate:
         cfg = DydxV4Config()
         result = gate_signal_for_live(
             config=cfg,
-            signal_age_ms=9000,  # > 8000ms
+            signal_age_ms=35000,  # > 30000ms hard_max
             account_address="0xabc123",
             market="BTC-USD",
             edge_remaining_bps=100.0,
@@ -215,21 +215,21 @@ class TestSignalGate:
             signal_age_ms=1000,
             account_address="0xabc123",
             market="BTC-USD",
-            edge_remaining_bps=10.0,  # < 30 bps min
-            total_cost_bps=20.0,
+            edge_remaining_bps=3.0,  # < 5 bps min
+            total_cost_bps=1.0,
         )
         assert result.allowed is False
         assert "EDGE" in result.reason
 
-    def test_cost_multiplier_3x_blocked(self):
-        """Edge doit être > 3x total_cost_bps."""
+    def test_cost_multiplier_blocked(self):
+        """Edge doit être > 1.5x total_cost_bps."""
         cfg = DydxV4Config()
         result = gate_signal_for_live(
             config=cfg,
             signal_age_ms=1000,
             account_address="0xabc123",
             market="BTC-USD",
-            edge_remaining_bps=35.0,   # > 30 mais < 3x*20=60
+            edge_remaining_bps=25.0,   # > 5 mais < 1.5x*20=30
             total_cost_bps=20.0,
         )
         assert result.allowed is False

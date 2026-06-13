@@ -25,6 +25,7 @@ def _make_config(mode=SimulationMode.LIVE) -> DydxV4Config:
     """Crée une config testnet paper-only (simulation uniquement)."""
     return DydxV4Config(
         network="testnet",
+        market_flow_enabled=False,
         mode=DydxMode(mode.value),  # SimulationMode → DydxMode par valeur
     )
 
@@ -39,6 +40,14 @@ def _make_wallet(address: str, score: float = 0.8, market: str = "ETH-USD") -> W
     )
 
 
+def _make_orderbook(mid: float, spread_bps: float = 2.0, size: float = 100.0) -> dict:
+    half = mid * spread_bps / 2 / 10_000
+    return {
+        "bids": [{"price": str(mid - half), "size": str(size)} for _ in range(5)],
+        "asks": [{"price": str(mid + half), "size": str(size)} for _ in range(5)],
+    }
+
+
 def _make_observer(shortlist=None, poll_interval=0.01):
     config = _make_config()
     rest = MagicMock()
@@ -50,6 +59,13 @@ def _make_observer(shortlist=None, poll_interval=0.01):
             "SOL-USD": {"oraclePrice": "65.0", "indexPrice": "65.0"},
         }
     }
+    rest.get_orderbook.side_effect = lambda market: {
+        "ETH-USD": _make_orderbook(1650.0),
+        "BTC-USD": _make_orderbook(61500.0),
+        "SOL-USD": _make_orderbook(65.0),
+    }.get(market, _make_orderbook(100.0))
+    rest.get_candles.return_value = {"candles": []}
+    rest.get_market.side_effect = lambda market: {"markets": {market: {"nextFundingRate": "0"}}}
     cluster = DydxClusterDetector(consensus_window_ms=60_000, min_notional_usdc=0.0)
     wallets = shortlist or [
         _make_wallet("dydx1aaa", 0.9),
@@ -276,9 +292,11 @@ class TestLiveObserver:
         assert obs.stats.positions_opened == 1
 
         # Simuler hausse de prix → take-profit
-        entry_price = 1650.0
-        tp_price = entry_price * (1 + TAKE_PROFIT_PCT / 100)
-        obs._mark_prices["ETH-USD"] = tp_price + 1.0  # au-dessus du TP
+        # Fill honnête (Selection v2): l'entrée LONG est pénalisée vs mid,
+        # donc on utilise le TP réel de la position, pas un TP recalculé du mid.
+        pos = next(iter(obs._open_positions.values()))
+        assert pos.entry_price > 1650.0  # jamais au mid pour un LONG
+        obs._mark_prices["ETH-USD"] = pos.take_profit_price * 1.001  # au-dessus du TP
         obs._check_exits()
 
         assert obs.stats.positions_closed == 1

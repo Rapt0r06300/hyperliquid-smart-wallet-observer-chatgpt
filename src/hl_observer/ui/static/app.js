@@ -13,6 +13,26 @@ function tickClock() {
   $("#clock").textContent = new Date().toLocaleTimeString();
 }
 
+// --- Anti-saut d'ecran -----------------------------------------------------
+// Les re-render complets (innerHTML) changent la hauteur de page et faisaient
+// "sauter" la vue d'un panneau a l'autre. On capture/restaure la position de
+// scroll et le focus autour de chaque rendu pour garder l'ecran stable.
+function preserveScroll(renderFn) {
+  const x = window.scrollX;
+  const y = window.scrollY;
+  const active = document.activeElement;
+  try {
+    renderFn();
+  } finally {
+    // Restauration synchrone: le re-render ci-dessus est synchrone (innerHTML),
+    // donc la hauteur a deja change ici — on remet la vue ou elle etait.
+    window.scrollTo(x, y);
+    if (active && active !== document.body && typeof active.focus === "function" && document.contains(active)) {
+      try { active.focus({ preventScroll: true }); } catch (_e) { /* focus best-effort */ }
+    }
+  }
+}
+
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[m]));
 }
@@ -548,7 +568,7 @@ function renderSimulationOverview(payload) {
     ["Gain/perte encaisse", formatUsd(equity.realized_pnl_usdc ?? 0)],
     ["Gain/perte en cours", formatUsd(equity.unrealized_pnl_usdc ?? 0)],
     ["Capital utilise", `${formatBalance(equity.open_exposure_usdt ?? 0)} / libre ${formatBalance(equity.free_equity_usdt ?? 1000)}`],
-    ["Journal decisions", `${formatUsd(decisionLogPnl.closed_log_event_pnl_usdc ?? 0)} / ${Number(decisionLogPnl.events || 0)} evts`]
+    ["Journal (anciens runs, hors session)", `${formatUsd(decisionLogPnl.closed_log_event_pnl_usdc ?? 0)} / ${Number(decisionLogPnl.events || 0)} evts`]
   ];
   summary.innerHTML = metrics.map(([label, value]) => `
     <div class="simulation-metric">
@@ -589,7 +609,7 @@ function renderSimulationOverview(payload) {
         <strong>${escapeHtml(pnlControlText)}</strong>
       </div>
       <div class="simulation-live-pill ${Number(decisionLogPnl.closed_log_event_pnl_usdc || 0) < 0 ? "red" : "green"}">
-        <span>Journal decisions</span>
+        <span>Journal (anciens runs, hors session)</span>
         <strong>${escapeHtml(formatUsd(decisionLogPnl.closed_log_event_pnl_usdc || 0))} :: ${escapeHtml(decisionLogPnl.events || 0)} evenements</strong>
       </div>
       <div class="simulation-live-pill green">
@@ -784,8 +804,13 @@ function drawSimulationMetaGraph(candles, equity) {
   const ratio = window.devicePixelRatio || 1;
   const width = Math.max(640, Math.floor(rect.width || canvas.width));
   const height = Math.max(220, Math.min(300, Math.floor(rect.height || 260)));
-  canvas.width = Math.floor(width * ratio);
-  canvas.height = Math.floor(height * ratio);
+  // Ne redimensionner le canvas QUE si la taille change reellement.
+  // Reassigner canvas.width/height le vide et force un reflow a chaque frame
+  // (toutes les secondes) => scintillement + saut de scroll. On l'evite.
+  const nextW = Math.floor(width * ratio);
+  const nextH = Math.floor(height * ratio);
+  if (canvas.width !== nextW) canvas.width = nextW;
+  if (canvas.height !== nextH) canvas.height = nextH;
   const ctx = canvas.getContext("2d");
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
@@ -1008,29 +1033,33 @@ async function loadSimpleHome() {
     safeGetJson("/api/copy/no-trade-report", {}),
     lastSimulationPayload || getSimulationOverviewPayload()
   ]);
-  renderSimpleHome(home);
-  renderScanOverview(home, autoscan);
-  renderSourceBreakdown(home, explorerStatus);
-  renderExplorerTape(explorerTape);
-  renderRejectedWallets(rejectedCandidates);
-  renderStatus(status);
-  renderDiscoveryStatus(discovery);
-  renderCandidates(candidates);
-  renderSelected(selected);
-  renderWalletsFeed(candidates, selected, knownWallets);
-  renderPositionsFeed(positions);
-  renderFillsFeed(fills);
-  renderDeltasFeed(deltas);
-  renderOpenOrdersFeed(openOrders);
-  renderTopByCoinFeed(topByCoin);
-  renderCopyStatus(copyStatus);
-  renderLeaderActivity(leaderActivity);
-  renderNoTradeReport(noTradeReport);
-  renderSimulationOverview(simulationOverview);
-  renderCoinMetrics(metrics);
-  renderEvents(events);
-  renderLogs(logs);
-  renderActionCatalog(actions);
+  // Un seul preserveScroll englobe tout le re-render complet de la page
+  // pour eviter que la vue saute pendant la reconstruction des panneaux.
+  preserveScroll(() => {
+    renderSimpleHome(home);
+    renderScanOverview(home, autoscan);
+    renderSourceBreakdown(home, explorerStatus);
+    renderExplorerTape(explorerTape);
+    renderRejectedWallets(rejectedCandidates);
+    renderStatus(status);
+    renderDiscoveryStatus(discovery);
+    renderCandidates(candidates);
+    renderSelected(selected);
+    renderWalletsFeed(candidates, selected, knownWallets);
+    renderPositionsFeed(positions);
+    renderFillsFeed(fills);
+    renderDeltasFeed(deltas);
+    renderOpenOrdersFeed(openOrders);
+    renderTopByCoinFeed(topByCoin);
+    renderCopyStatus(copyStatus);
+    renderLeaderActivity(leaderActivity);
+    renderNoTradeReport(noTradeReport);
+    renderSimulationOverview(simulationOverview);
+    renderCoinMetrics(metrics);
+    renderEvents(events);
+    renderLogs(logs);
+    renderActionCatalog(actions);
+  });
   } finally {
     fullRefreshInFlight = false;
   }
@@ -1041,7 +1070,7 @@ async function refreshSimulationOverview() {
   simulationRefreshInFlight = true;
   try {
     const simulationOverview = await getSimulationOverviewPayload();
-    renderSimulationOverview(simulationOverview);
+    preserveScroll(() => renderSimulationOverview(simulationOverview));
   } finally {
     simulationRefreshInFlight = false;
   }
@@ -1069,10 +1098,22 @@ async function startAutoScanWithDiscoveryIfAllowed() {
   }
 }
 
+// Debounce des messages WebSocket: une rafale de messages ne declenche
+// qu'UN seul refresh (au plus toutes les 1.5s) au lieu d'un re-render par
+// message, ce qui evitait le scintillement/saut quand le flux est dense.
+let wsRefreshTimer = null;
+function scheduleWsRefresh() {
+  if (wsRefreshTimer) return;
+  wsRefreshTimer = setTimeout(() => {
+    wsRefreshTimer = null;
+    refreshSimulationOverview().catch(() => {});
+  }, 1500);
+}
+
 function connectWebSocket() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(`${proto}://${location.host}/ws`);
-  socket.onmessage = () => refreshSimulationOverview().catch(() => {});
+  socket.onmessage = () => scheduleWsRefresh();
   socket.onclose = () => setTimeout(connectWebSocket, 2000);
 }
 
@@ -1095,9 +1136,15 @@ function wireUi() {
   });
 }
 
+// Cadences de refresh: l'ancien 1000ms (simulation) + 10000ms (home complet)
+// etait trop agressif et faisait sauter l'ecran. 4s/20s reste largement
+// temps reel pour une simulation paper et stabilise l'affichage.
+const SIMULATION_REFRESH_MS = 4000;
+const HOME_REFRESH_MS = 20000;
+
 setInterval(tickClock, 1000);
-setInterval(() => refreshSimulationOverview().catch(() => {}), 1000);
-setInterval(() => loadSimpleHome().catch(() => {}), 10000);
+setInterval(() => refreshSimulationOverview().catch(() => {}), SIMULATION_REFRESH_MS);
+setInterval(() => loadSimpleHome().catch(() => {}), HOME_REFRESH_MS);
 tickClock();
 wireUi();
 connectWebSocket();

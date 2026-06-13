@@ -4,6 +4,7 @@ Moteur de signaux dYdX v4 — candidats seulement, jamais des ordres.
 Un signal est accepté seulement si TOUS les critères passent:
 - source FRESH (< 4s idéalement, < 8s maximum absolu)
 - account/subaccount shortlisté
+- consensus multi-wallets atteint (si tracker fourni)
 - lifecycle clair (pas UNKNOWN)
 - market whitelisté
 - liquidité OK, spread OK
@@ -32,6 +33,7 @@ from hyper_smart_observer.dydx_v4.models import (
 )
 from hyper_smart_observer.dydx_v4.safety import gate_signal_for_live, is_test_fixture_account
 from hyper_smart_observer.dydx_v4.ws_client import WsStatus
+from hyper_smart_observer.dydx_v4.consensus import ConsensusTracker
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +55,17 @@ class DydxSignalEngine:
     Jamais d'ordres. Seulement des SignalCandidate.
     """
 
-    def __init__(self, config: DydxV4Config) -> None:
+    def __init__(
+        self,
+        config: DydxV4Config,
+        consensus: Optional[ConsensusTracker] = None,
+    ) -> None:
         self.config = config
         self.state = SignalEngineState()
         self._no_trade_log: list[NoTradeDecision] = []
+        # Consensus gate (bot viral): activé seulement si un tracker est fourni
+        # ET config.consensus_required=True. Sans tracker → comportement v1 inchangé.
+        self.consensus = consensus
 
     def update_shortlist(self, account_keys: set[str]) -> None:
         """Mettre à jour la shortlist des comptes à observer."""
@@ -145,6 +154,29 @@ class DydxSignalEngine:
         # 6. Market blacklisté?
         if market_id in self.config.market_blacklist:
             return _no_trade(NoTradeReason.MARKET_BLACKLISTED, f"market={market_id}")
+
+        # 6b. CONSENSUS GATE (bot viral): une entrée n'est valide que si
+        # ≥K comptes shortlistés distincts convergent (même marché, même sens)
+        # dans la fenêtre. Les CLOSE/REDUCE ne sont JAMAIS bloqués (on doit
+        # toujours pouvoir sortir).
+        if (
+            self.consensus is not None
+            and self.config.consensus_required
+            and lifecycle in (LifecycleEvent.OPEN, LifecycleEvent.ADD)
+        ):
+            self.consensus.record_open(
+                account_key, market_id, side.value, now_ms, size * price
+            )
+            consensus_res = self.consensus.check(
+                market_id, side.value, now_ms,
+                min_wallets=self.config.consensus_min_wallets,
+            )
+            if not consensus_res.met:
+                return _no_trade(
+                    NoTradeReason.CONSENSUS_NOT_REACHED,
+                    f"wallets={consensus_res.distinct_accounts}/"
+                    f"{consensus_res.required} window={consensus_res.window_ms}ms",
+                )
 
         # 7. Stale signal
         if signal_age_ms > self.config.hard_max_signal_age_ms:

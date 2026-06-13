@@ -25,7 +25,7 @@ except ImportError:
             return self.value
 
 from queue import Empty, Queue
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +165,10 @@ class DydxIndexerWsClient:
             self._status = WsStatus.FAILED
             return
 
+        if self._thread is not None and self._thread.is_alive():
+            logger.debug("dYdX WS client deja demarre: %s", self.ws_url)
+            return
+
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="dydx-ws-client"
@@ -180,6 +184,12 @@ class DydxIndexerWsClient:
                 self._ws.close()
             except Exception:
                 pass
+        if (
+            self._thread is not None
+            and self._thread.is_alive()
+            and threading.current_thread() is not self._thread
+        ):
+            self._thread.join(timeout=2.0)
         self._status = WsStatus.DISCONNECTED
         logger.info("dYdX WS client arrêté")
 
@@ -310,7 +320,7 @@ class DydxIndexerWsClient:
         self._last_message_at = time.monotonic()
 
     def _send_subscription(self, key: str) -> None:
-        if not self._ws or self._status not in (WsStatus.CONNECTED, WsStatus.SUBSCRIBED):
+        if not self._can_send():
             return
         payload = self._subscriptions.get(key)
         if payload:
@@ -318,14 +328,19 @@ class DydxIndexerWsClient:
                 self._ws.send(json.dumps(payload))
                 logger.debug("WS subscribed: %s", key)
             except Exception as e:
-                logger.error("WS send subscription error: %s", e)
+                logger.warning("WS subscription queued after send failure: %s", e)
+                self._status = WsStatus.DEGRADED
+
+    def _can_send(self) -> bool:
+        if not self._ws or self._status not in (WsStatus.CONNECTED, WsStatus.SUBSCRIBED):
+            return False
+        sock = getattr(self._ws, "sock", None)
+        if sock is not None and getattr(sock, "connected", False) is False:
+            return False
+        return True
 
     @property
     def seconds_since_last_message(self) -> float:
         if self._last_message_at == 0:
             return float("inf")
         return time.monotonic() - self._last_message_at
-
-
-# Type alias pour annotation
-Any = object

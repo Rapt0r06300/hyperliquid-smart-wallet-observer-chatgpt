@@ -187,6 +187,53 @@ def cmd_paper(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_leaderboard(args: argparse.Namespace) -> int:
+    """
+    Construire/rafraîchir le leaderboard dYdX (Job A du bot viral).
+    READ-ONLY: historicalPnl + fills publics. Aucun ordre.
+    """
+    print(DISCLAIMER)
+    config = load_config_from_env()
+
+    from hyper_smart_observer.dydx_v4.leaderboard import DydxLeaderboardBuilder
+
+    rest = DydxIndexerRestClient(base_url=config.indexer_rest_url)
+    cosmos = None
+    try:
+        from hyper_smart_observer.dydx_v4.cosmos_client import DydxCosmosLcdClient
+        cosmos = DydxCosmosLcdClient()
+    except Exception as e:
+        print(f"Cosmos LCD indisponible ({e}) — énumération via base seulement")
+
+    builder = DydxLeaderboardBuilder(
+        rest=rest,
+        cosmos=cosmos,
+        db_path=config.db_path,
+    )
+    result = builder.build(
+        max_candidates=args.max_candidates,
+        max_scan_pages=args.scan_pages,
+    )
+
+    print(f"\n--- Leaderboard {result.run_id} ---")
+    print(f"Candidats évalués : {result.candidates_evaluated}")
+    print(f"Classés           : {len(result.entries)}")
+    print(f"Copiables         : {len(result.shortlist)} (ELITE+STANDARD)")
+    print(f"Promotions        : {len(result.promotions)} | Démotions: {len(result.demotions)}")
+    print(f"\n{'rang':<5}{'tier':<10}{'score':<8}{'WR':<7}{'PF':<7}{'Sharpe':<8}{'trades':<8}adresse")
+    for e in result.entries[:args.top]:
+        m = e.metrics
+        print(
+            f"{e.rank:<5}{e.tier.value:<10}{e.score:<8.1f}{m.winrate:<7.0%}"
+            f"{m.profit_factor:<7.2f}{m.sharpe:<8.2f}{m.closed_trades:<8}{e.address[:24]}"
+        )
+    if args.export:
+        builder.export_shortlist_json(result, args.export)
+        print(f"\nShortlist exportée → {args.export}")
+    print(f"\n{result.disclaimer}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dydx",
@@ -206,6 +253,18 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--address", default=None, help="Adresse dYdX à backfiller")
     backfill.add_argument("--subaccount", type=int, default=0, help="Numéro de subaccount")
 
+    lb = subs.add_parser(
+        "leaderboard",
+        help="Construire le leaderboard dYdX (historicalPnl + fills, READ-ONLY)",
+    )
+    lb.add_argument("--max-candidates", type=int, default=100, dest="max_candidates")
+    lb.add_argument("--scan-pages", type=int, default=5, dest="scan_pages")
+    lb.add_argument("--top", type=int, default=20, help="Lignes affichées")
+    lb.add_argument(
+        "--export", default="data/leaderboard_shortlist.json",
+        help="Chemin d'export JSON de la shortlist copiable",
+    )
+
     return parser
 
 
@@ -222,6 +281,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "backfill": cmd_backfill,
         "dashboard": cmd_dashboard,
         "paper": cmd_paper,
+        "leaderboard": cmd_leaderboard,
     }
 
     if not args.command or args.command not in dispatch:

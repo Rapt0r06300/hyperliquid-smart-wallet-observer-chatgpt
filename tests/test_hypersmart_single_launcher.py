@@ -11,9 +11,9 @@ def test_single_hypersmart_launcher_exists_and_forces_simulation_mode():
     assert "HL_ENABLE_MAINNET_EXECUTION=0" in text
     assert "HL_ENABLE_TESTNET_EXECUTION=0" in text
     assert "SIMULATION_ONLY_UNTIL_MANUAL_REVIEW" in text
-    assert "HYPERSMART_SIMULATION_MAX_SIGNAL_AGE_MS=120000" in text
-    assert "HYPERSMART_SIMULATION_ALLOW_ADD_AS_ENTRY=1" in text
-    assert "HYPERSMART_SIMULATION_MIN_EDGE_BPS=8" in text
+    assert "HYPERSMART_SIMULATION_MAX_SIGNAL_AGE_MS=6000" in text
+    assert "HYPERSMART_SIMULATION_ALLOW_ADD_AS_ENTRY=0" in text
+    assert "HYPERSMART_SIMULATION_MIN_EDGE_BPS=35" in text
     assert "-Port 8794" in text
     assert "-IntervalSeconds 15" in text
     assert "-MaxLeaders 50" in text
@@ -50,7 +50,7 @@ def test_start_script_initializes_everything_without_execution():
     assert "hypersmart_simulation_session.sqlite3" in text
     assert "DB session simulation" in text
     assert "HL_LOG_LEVEL" in text
-    assert 'HYPERSMART_SIMULATION_MIN_EDGE_BPS = "8"' in text
+    assert 'HYPERSMART_SIMULATION_MIN_EDGE_BPS = "35"' in text
     assert "simulation-readiness --from-logs" in text
     assert "hypersmart_simulation_poll_loop.ps1" in text
     assert "hl_observer live-user-fills-scan" in text
@@ -84,7 +84,7 @@ def test_start_script_initializes_everything_without_execution():
     assert "RedirectStandardOutput" in text
     assert "RedirectStandardError" in text
     assert "Start-Process -WindowStyle Hidden" not in text
-    assert "/#simulationPanel" in text
+    assert "/static/simulation_v2.html" in text
     assert "/exchange" not in text
 
 

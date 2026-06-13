@@ -38,7 +38,7 @@ TAKER_FEE_BPS: float = 5.0         # frais taker dYdX v4 (0.05%)
 ROUND_TRIP_FEE_BPS: float = 10.0   # entrée + sortie
 
 # Freshness decay: 1.0 à 0ms, 0.0 à MAX_SIGNAL_AGE_MS
-MAX_SIGNAL_AGE_MS: int = 8_000
+MAX_SIGNAL_AGE_MS: int = 15_000
 
 # Leader edge par défaut si inconnu (bps)
 DEFAULT_LEADER_EDGE_BPS: float = 15.0
