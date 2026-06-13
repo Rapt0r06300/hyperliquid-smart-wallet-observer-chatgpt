@@ -1,0 +1,4 @@
+﻿ChatGPT / GitHub access proof
+Repo: Rapt0r06300/hyperliquid-smart-wallet-observer-chatgpt
+Date: 2026-06-13 18:05:35
+Purpose: verify that main can be modified safely.
